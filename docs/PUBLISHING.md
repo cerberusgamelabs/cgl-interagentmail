@@ -8,9 +8,27 @@ InterAgentMail is released under the MIT License, copyright 2026 Cerberus Game L
 
 1. Confirm the canonical GitHub links in `pyproject.toml` still resolve.
 2. Confirm that the `cgl-interagentmail` PyPI name is still available. The first successful upload reserves it.
-3. Create PyPI and TestPyPI projects and configure a trusted publisher or narrowly scoped upload token.
+3. Configure PyPI Trusted Publishing. No long-lived PyPI token is required.
 
 Do not put PyPI tokens in the repository, command history, or website files.
+
+### First-time PyPI trusted publisher
+
+Because the PyPI project does not exist yet, sign in to PyPI and create a pending GitHub publisher with these exact values:
+
+```text
+PyPI project name: cgl-interagentmail
+Owner: cerberusgamelabs
+Repository: cgl-interagentmail
+Workflow filename: publish.yml
+Environment: pypi
+```
+
+Also create a GitHub environment named `pypi` at `Settings > Environments > New environment`. Requiring a Cerberus Game Labs maintainer to approve deployments is recommended.
+
+After the pending publisher exists, open the repository's **Actions > Publish to PyPI** workflow, choose **Run workflow**, keep tag `v1.1.0`, and approve the `pypi` environment deployment if prompted. The workflow builds and tests in a job without publishing credentials, then passes only the distributions to the OIDC-enabled publishing job.
+
+The pending publisher does not reserve the package name. Run the workflow promptly after configuring it.
 
 ## Build locally
 
