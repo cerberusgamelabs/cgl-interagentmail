@@ -17,8 +17,10 @@ Created by Cerberus Game Labs and released to the world as open-source software 
 Install `pipx`, then run:
 
 ```console
-pipx install cgl-interagentmail
+pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
 ```
+
+Once the PyPI listing is live, users may instead run `pipx install cgl-interagentmail`.
 
 Register the projects that should communicate and start the local service:
 
@@ -45,9 +47,10 @@ InterAgentMail is intended for trusted local projects and users. Default agents 
 - Source code: `https://github.com/cerberusgamelabs/cgl-interagentmail`
 - Full installation, upgrade, troubleshooting, and uninstall guide: `https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/docs/INSTALL.md`
 - Issues and support: `https://github.com/cerberusgamelabs/cgl-interagentmail/issues`
+- Current release: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/tag/v1.1.0`
 - Python package: `https://pypi.org/project/cgl-interagentmail/`
-- Current wheel: `cgl_interagentmail-1.1.0-py3-none-any.whl`
-- SHA-256 checksums: `SHA256SUMS.txt`
+- Current wheel: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl`
+- SHA-256 checksums: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/SHA256SUMS.txt`
 - License: `https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/LICENSE`
 
-The PyPI and direct-download links should be made live only after their corresponding artifacts are uploaded.
+The GitHub release and direct-download links are live. Add the PyPI link to the rendered site only after the PyPI upload succeeds.
