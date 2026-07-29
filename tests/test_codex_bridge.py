@@ -73,7 +73,7 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("responsesapiClientMetadata", turn_calls[0])
         self.assertEqual("on-request", turn_calls[0]["approvalPolicy"])
         self.assertEqual("workspaceWrite", turn_calls[0]["sandboxPolicy"]["type"])
-        self.assertEqual([str(self.alpha_root)], turn_calls[0]["sandboxPolicy"]["writableRoots"])
+        self.assertEqual([str(self.alpha_root.resolve())], turn_calls[0]["sandboxPolicy"]["writableRoots"])
         self.assertTrue(self.state.is_delivered(message["id"]))
         self.assertFalse(await bridge.deliver_once())
 
@@ -156,7 +156,7 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("created-thread", thread["id"])
         start = next(params for method, params in client.calls if method == "thread/start")
-        self.assertEqual(str(self.alpha_root), start["cwd"])
+        self.assertEqual(str(self.alpha_root.resolve()), start["cwd"])
         self.assertEqual("workspace-write", start["sandbox"])
         self.assertEqual("on-request", start["approvalPolicy"])
 

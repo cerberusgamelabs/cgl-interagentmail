@@ -42,7 +42,7 @@ class OrchestratorSetupTests(unittest.TestCase):
         self.assertIn("[mcp_servers.interagentmail]", config_text)
         self.assertIn("--project-root", config_text)
         self.assertEqual(first, second)
-        self.assertEqual(str(self.project), registered_projects()["ExampleProject"]["project_root"])
+        self.assertEqual(str(self.project.resolve()), registered_projects()["ExampleProject"]["project_root"])
         self.assertEqual("Example Agent", iam.display_name("ExampleProject"))
 
     def test_setup_rejects_conflicting_unmanaged_mcp_section(self) -> None:
@@ -132,7 +132,7 @@ class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
             for method, params in FakeSupervisorClient.instances[0].calls
             if method == "thread/start"
         )
-        self.assertEqual(str(self.project), start["cwd"])
+        self.assertEqual(str(self.project.resolve()), start["cwd"])
         self.assertEqual("workspace-write", start["sandbox"])
         self.assertEqual("on-request", start["approvalPolicy"])
         bootstrap = next(
