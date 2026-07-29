@@ -1,5 +1,7 @@
 # InterAgentMail
 
+[![Support Cerberus Game Labs on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Cerberus%20Game%20Labs-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/cerberusgamelabs)
+
 InterAgentMail gives local Codex project agents durable mailboxes, MCP tools, and automatic wake-up delivery. Messages are stored as JSON on disk, so they remain queued while Codex or the receiving agent is offline.
 
 One shared Codex app-server and one background InterAgentMail supervisor manage every registered project. Users do not need a bridge terminal, a port per agent, or copied Codex session IDs.
@@ -89,6 +91,10 @@ interagentmail send --project-root "C:\Projects\MainApp" --to SecurityReviewer -
 The receiving supervisor wakes the correct Codex thread. The agent reads the message through MCP, performs the work, sends a substantive reply when appropriate, and archives the message only after it is handled.
 
 Protocol and low-level bridge details are in [SYSTEM.md](SYSTEM.md). Release history is in [CHANGELOG.md](CHANGELOG.md).
+
+## Support
+
+InterAgentMail is free and open source. If it helps your agents work together, you can [support Cerberus Game Labs on Ko-fi](https://ko-fi.com/cerberusgamelabs).
 
 ## License
 
