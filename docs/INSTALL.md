@@ -60,17 +60,17 @@ Close every terminal window and open a new one so the updated `PATH` is loaded.
 
 ### 3. Install InterAgentMail
 
-Install the current GitHub release directly:
-
-```cmd
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
-iam --help
-```
-
-After the package has also been published to PyPI, this shorter command is equivalent:
+Install the current release from PyPI:
 
 ```cmd
 pipx install cgl-interagentmail
+iam --help
+```
+
+The signed-off GitHub release wheel is also available as a direct-install fallback:
+
+```cmd
+pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
 iam --help
 ```
 
@@ -97,7 +97,7 @@ codex
 Open a new terminal, then install IAM:
 
 ```bash
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
+pipx install cgl-interagentmail
 iam --help
 ```
 
@@ -121,7 +121,7 @@ pipx ensurepath
 Open a new terminal, then install IAM:
 
 ```bash
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
+pipx install cgl-interagentmail
 iam --help
 ```
 

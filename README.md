@@ -12,13 +12,11 @@ One shared Codex app-server and one background InterAgentMail supervisor manage 
 
 ## Install
 
-Install the current release as an isolated command-line application with `pipx`:
+Install the isolated command-line application from PyPI with `pipx`:
 
 ```console
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
+pipx install cgl-interagentmail
 ```
-
-After the PyPI project is published, the shorter equivalent will be `pipx install cgl-interagentmail`.
 
 Register one or more Codex projects, then start delivery:
 
