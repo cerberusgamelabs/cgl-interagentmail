@@ -1,0 +1,17 @@
+__pycache__/
+.agents/
+.codex/
+.venv/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+DEV/
+skills/
+InterAgentChatReader/
+run/
+config.json
+mailboxes/
+chats/
+InterAgentChatReader.zip
