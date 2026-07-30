@@ -1,0 +1,22 @@
+{
+  "unreleased_path": "CHANGELOG.md",
+  "default_remote": "origin",
+  "forbidden_paths": [
+    ".env",
+    ".venv/",
+    "build/",
+    "dist/",
+    "mailboxes/",
+    "chats/",
+    "run/",
+    "config.json"
+  ],
+  "commit_types": [
+    "feat",
+    "fix",
+    "docs",
+    "refactor",
+    "test",
+    "chore"
+  ]
+}

@@ -19,6 +19,7 @@ prune dist
 prune InterAgentChatReader
 prune mailboxes
 prune run
+prune reports
 prune skills
 exclude config.json
 exclude InterAgentChatReader.zip

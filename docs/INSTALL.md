@@ -70,14 +70,14 @@ iam --help
 The signed-off GitHub release wheel is also available as a direct-install fallback:
 
 ```cmd
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.1.0/cgl_interagentmail-1.1.0-py3-none-any.whl
+pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.2.0/cgl_interagentmail-1.2.0-py3-none-any.whl
 iam --help
 ```
 
 To install a wheel downloaded directly from Cerberus Game Labs instead, use its actual downloaded path:
 
 ```cmd
-pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.1.0-py3-none-any.whl"
+pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.2.0-py3-none-any.whl"
 iam --help
 ```
 
@@ -147,7 +147,11 @@ Project folder names become mailbox addresses by default. Set a human-facing sen
 iam setup "C:\Projects\MainApp" --display-name "Adrian"
 ```
 
-Setup modifies only a clearly marked InterAgentMail block in each project's `.codex/config.toml`. Running setup again updates that managed block without replacing the rest of the file.
+Setup modifies only a clearly marked InterAgentMail block in each project's `.codex/config.toml`. Running setup again updates that managed block without replacing the rest of the file. Display names are optional; without one, IAM uses the mailbox address and does not create a human persona.
+
+The project folder basename is its mailbox address. IAM refuses a second physical project with the same basename before changing the mailbox or project configuration. Use unique project folder names for separate reviewer instances.
+
+Automation and reviewer platforms should use `iam register PATH --json` and discover compatibility with `iam capabilities --json`. The stable schema, lifecycle, collision errors, and identity ownership rules are documented in [INTEGRATION.md](INTEGRATION.md).
 
 ## Start automatic delivery
 
@@ -247,9 +251,19 @@ Mailbox data is intentionally not deleted. It remains at `%LOCALAPPDATA%\InterAg
 Start with:
 
 ```cmd
-iam status
-iam restart
+iam doctor
+iam doctor --project "C:\Projects\SecurityReviewer" --json
 ```
+
+`iam doctor` performs read-only checks and distinguishes failures from warnings such as intentionally stopped background services. Use the project-scoped JSON form for automation. If you need support, generate a shareable Markdown report:
+
+```cmd
+iam report
+```
+
+By default the report is written under the IAM data directory's `reports` folder. It includes versions, service health, registration and MCP checks, mailbox counts, and log statistics. It excludes mailbox and chat contents, thread IDs, raw configuration, environment variables, and raw app-server log lines. Project names and paths, user paths, email addresses, IDs, and common credential formats are replaced. Review the generated file before sharing it publicly.
+
+Use `iam report --output PATH` to choose a destination or `iam report --stdout` to print it. IAM refuses to replace an existing output file unless `--force` is provided. After reviewing the diagnosis, `iam restart` remains the usual way to restart both managed background services.
 
 Logs are under `run/app-server.log` and `run/supervisor.log` inside the IAM data directory.
 
@@ -263,4 +277,4 @@ Common issues:
 - **An old bridge is also running:** stop manually launched `IAMBridge` or `iam-codex-bridge` processes; the supervisor replaces them.
 - **A thread cannot resume:** run `iam restart`. The supervisor creates and persists a replacement thread when the saved one no longer exists.
 
-For support, open an issue at <https://github.com/cerberusgamelabs/cgl-interagentmail/issues> and include `iam status`, `iam --version`, `codex --version`, the operating system, and the relevant log excerpt. Remove private project paths or message content before posting logs publicly. Report suspected vulnerabilities privately as described in <https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/SECURITY.md>.
+For support, open an issue at <https://github.com/cerberusgamelabs/cgl-interagentmail/issues> and attach the output from `iam report` after reviewing it. Report suspected vulnerabilities privately as described in <https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/SECURITY.md>.

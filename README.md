@@ -42,14 +42,20 @@ Source code, releases, and issue tracking are hosted at <https://github.com/cerb
 
 ```console
 iam status
+iam doctor
+iam report
 iam open [PROJECT]
 iam restart
 iam stop
 iam stop --all
+iam register [PROJECT ...]
 iam unregister [PROJECT ...]
+iam capabilities --json
 ```
 
-- `iam status` shows services, projects, and pinned thread IDs.
+- `iam status` shows services, projects, and pinned thread IDs; `--json` provides stable schema 1.0 output.
+- `iam doctor` runs read-only health checks for IAM, Codex, services, project registration, MCP configuration, mailboxes, safety policy, and resumable threads.
+- `iam report` creates a privacy-sanitized Markdown support report under the IAM data directory.
 - `iam open` resumes the exact thread owned by the current or named project.
 - `iam stop` stops mail delivery but leaves the shared app-server running.
 - `iam stop --all` stops both IAM-managed background services.
@@ -67,6 +73,42 @@ iam unregister [PROJECT ...]
 Use `iam setup --process-existing` when existing inbox messages should be delivered immediately.
 
 Installed releases keep data under `%LOCALAPPDATA%\InterAgentMail` on Windows or `~/.local/share/interagentmail` on macOS/Linux. Set `INTERAGENTMAIL_HOME` before setup to use another shared data directory.
+
+Project folder basenames become mailbox addresses. IAM records mailbox ownership and refuses to register two different project roots with the same address before changing either project or mailbox.
+
+## Automation and reviewer platforms
+
+Version 1.2 adds a stable JSON interface for tools that create reviewer projects or manage agent fleets:
+
+```console
+iam capabilities --json
+iam register "C:\Projects\SecurityReviewer" --json
+iam status --json
+iam doctor --project "C:\Projects\SecurityReviewer" --json
+iam unregister "C:\Projects\SecurityReviewer" --json
+```
+
+`iam register` is the automation-oriented alias for `iam setup` and is safe to repeat while delivery is running. Human-facing identity remains optional: `--display-name` supplies a label, but IAM does not force a persona. See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the versioned envelope, stable errors, collision behavior, identity ownership, and full lifecycle contract.
+
+## Diagnostics and support reports
+
+Run a read-only installation check at any time:
+
+```console
+iam doctor
+```
+
+Warnings describe optional or currently stopped components. Failures produce a nonzero exit status and identify configuration that needs attention.
+
+Create a report suitable for attaching to a support issue:
+
+```console
+iam report
+```
+
+The report contains software versions, operating-system information, service health, registered-project checks, mailbox counts, and bounded log statistics. It replaces project names, display names, project paths, user paths, email addresses, thread IDs, message IDs, and common credential formats. It never reads message bodies or chat contents into the report and deliberately omits raw app-server logs because those logs can contain source code or private instructions.
+
+Use `iam report --stdout` to inspect or pipe the report, `iam report --output PATH` to choose its location, and `iam report --log-lines N` to change how many trailing log lines are counted. Existing output files are preserved unless `--force` is supplied. Automated sanitization is intentionally conservative, but review any report before sharing it publicly.
 
 ## Safety
 

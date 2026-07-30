@@ -26,7 +26,7 @@ Environment: pypi
 
 Also create a GitHub environment named `pypi` at `Settings > Environments > New environment`. Requiring a Cerberus Game Labs maintainer to approve deployments is recommended.
 
-After the pending publisher exists, open the repository's **Actions > Publish to PyPI** workflow, choose **Run workflow**, keep tag `v1.1.0`, and approve the `pypi` environment deployment if prompted. The workflow builds and tests in a job without publishing credentials, then passes only the distributions to the OIDC-enabled publishing job.
+After the pending publisher exists, open the repository's **Actions > Publish to PyPI** workflow, choose **Run workflow**, keep tag `v1.2.0`, and approve the `pypi` environment deployment if prompted. The workflow builds and tests in a job without publishing credentials, then passes only the distributions to the OIDC-enabled publishing job.
 
 The pending publisher does not reserve the package name. Run the workflow promptly after configuring it.
 
@@ -40,11 +40,11 @@ From PowerShell in the repository:
 
 The script runs the tests, creates a wheel and source distribution, checks both with Twine, inspects their contents for excluded private/runtime paths, and writes SHA-256 checksums.
 
-Expected files for version 1.1.0:
+Expected files for version 1.2.0:
 
 ```text
-dist/cgl_interagentmail-1.1.0-py3-none-any.whl
-dist/cgl_interagentmail-1.1.0.tar.gz
+dist/cgl_interagentmail-1.2.0-py3-none-any.whl
+dist/cgl_interagentmail-1.2.0.tar.gz
 dist/SHA256SUMS.txt
 ```
 
@@ -55,7 +55,7 @@ Review the script output and manually inspect the archive listing before upload.
 Install the built wheel into a disposable pipx environment:
 
 ```powershell
-pipx install --force .\dist\cgl_interagentmail-1.1.0-py3-none-any.whl
+pipx install --force .\dist\cgl_interagentmail-1.2.0-py3-none-any.whl
 iam --help
 interagentmail --help
 iam-mcp --help
@@ -66,7 +66,7 @@ Use temporary project directories for a setup/open smoke test. Do not point a re
 ## Upload to TestPyPI
 
 ```powershell
-python -m twine upload --repository testpypi dist\cgl_interagentmail-1.1.0*
+python -m twine upload --repository testpypi dist\cgl_interagentmail-1.2.0*
 ```
 
 Install from TestPyPI while allowing dependencies from the main index:
@@ -82,7 +82,7 @@ Verify all four commands and perform a temporary-project smoke test.
 PyPI releases are immutable. Confirm the version, metadata, README rendering, license, and checksums before uploading:
 
 ```powershell
-python -m twine upload dist\cgl_interagentmail-1.1.0-py3-none-any.whl dist\cgl_interagentmail-1.1.0.tar.gz
+python -m twine upload dist\cgl_interagentmail-1.2.0-py3-none-any.whl dist\cgl_interagentmail-1.2.0.tar.gz
 ```
 
 Then install from PyPI into a clean pipx environment and repeat the smoke test:
