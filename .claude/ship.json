@@ -9,7 +9,8 @@
     "mailboxes/",
     "chats/",
     "run/",
-    "config.json"
+    "config.json",
+    "web.json"
   ],
   "commit_types": [
     "feat",

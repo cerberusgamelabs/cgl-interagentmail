@@ -19,6 +19,9 @@ from iam_orchestrator import (
     MCP_BEGIN,
     cmd_report,
     collect_diagnostics,
+    configure_web,
+    create_user_mailbox,
+    load_web_config,
     main,
     registered_projects,
     render_report,
@@ -62,8 +65,37 @@ class OrchestratorSetupTests(unittest.TestCase):
         self.assertEqual("unchanged", second["status"])
         self.assertEqual({key: value for key, value in first.items() if key != "status"}, {key: value for key, value in second.items() if key != "status"})
         self.assertEqual(str(self.project.resolve()), iam.profile("ExampleProject")["project_root"])
+        self.assertEqual("project", iam.profile("ExampleProject")["kind"])
         self.assertEqual(str(self.project.resolve()), registered_projects()["ExampleProject"]["project_root"])
         self.assertEqual("Example Agent", iam.display_name("ExampleProject"))
+
+    def test_setup_rejects_user_mailbox_and_preserves_web_identity(self) -> None:
+        create_user_mailbox("ExampleProject", "Human User")
+        configure_web("ExampleProject", "correct horse battery staple")
+
+        with self.assertRaises(SystemExit) as raised:
+            setup_project(self.project)
+
+        self.assertEqual("IAM_ADDRESS_COLLISION", raised.exception.error_code)
+        profile = iam.profile("ExampleProject")
+        self.assertEqual("user", profile["kind"])
+        self.assertNotIn("project_root", profile)
+        self.assertEqual("ExampleProject", load_web_config()["mailbox"])
+        self.assertNotIn("ExampleProject", registered_projects())
+        config_text = (self.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertEqual('model = "gpt-5.6-sol"\n', config_text)
+        self.assertNotIn(MCP_BEGIN, config_text)
+
+    def test_setup_rejects_legacy_generic_mailbox_without_migration(self) -> None:
+        iam.ensure_box("ExampleProject")
+
+        with self.assertRaises(SystemExit) as raised:
+            setup_project(self.project)
+
+        self.assertEqual("IAM_ADDRESS_COLLISION", raised.exception.error_code)
+        config_text = (self.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertEqual('model = "gpt-5.6-sol"\n', config_text)
+        self.assertNotIn(MCP_BEGIN, config_text)
 
     def test_setup_rejects_conflicting_unmanaged_mcp_section(self) -> None:
         config_path = self.project / ".codex" / "config.toml"
@@ -201,6 +233,93 @@ class IntegrationContractTests(unittest.TestCase):
         self.assertEqual("IAM_CONFIG_INVALID", payload["error"]["code"])
         self.assertEqual("not-json\n", profile_path.read_text(encoding="utf-8"))
         self.assertFalse((self.project / ".codex" / "config.toml").exists())
+
+    def test_web_setup_creates_authenticated_user_mailbox_without_plaintext_password(self) -> None:
+        with patch("iam_orchestrator.sys.stdin", io.StringIO("correct horse battery staple\n")):
+            code, payload = self.run_json([
+                "web", "setup", "Human", "--display-name", "Adrian", "--password-stdin", "--json"
+            ])
+
+        self.assertEqual(0, code)
+        self.assertEqual("user", payload["data"]["user_mailbox"]["kind"])
+        self.assertEqual("Human", payload["data"]["web"]["mailbox"])
+        web_config = (iam.ROOT / "web.json").read_text(encoding="utf-8")
+        self.assertNotIn("correct horse battery staple", web_config)
+        self.assertIn("pbkdf2-sha256", web_config)
+
+    def test_web_lan_setup_requires_explicit_network_risk_acknowledgement(self) -> None:
+        code, payload = self.run_json([
+            "web", "setup", "Human", "--lan", "--password-stdin", "--json"
+        ])
+
+        self.assertEqual(1, code)
+        self.assertEqual("IAM_WEB_LAN_ACK_REQUIRED", payload["error"]["code"])
+        self.assertFalse(iam.mailbox("Human").exists())
+
+    def test_web_status_reports_invalid_configuration_without_hiding_it(self) -> None:
+        iam.ROOT.mkdir(parents=True)
+        (iam.ROOT / "web.json").write_text("not-json\n", encoding="utf-8")
+
+        with (
+            patch("iam_orchestrator.read_pid", return_value=None),
+            patch("iam_orchestrator.pid_alive", return_value=False),
+        ):
+            code, payload = self.run_json(["web", "status", "--json"])
+
+        self.assertEqual(0, code)
+        self.assertTrue(payload["data"]["web"]["configured"])
+        self.assertFalse(payload["data"]["web"]["running"])
+        self.assertEqual("IAM_WEB_CONFIG_INVALID", payload["data"]["web"]["error"]["code"])
+
+    def test_web_status_flags_live_instance_identity_mismatch(self) -> None:
+        with patch("iam_orchestrator.sys.stdin", io.StringIO("correct horse battery staple\n")):
+            setup_code, _payload = self.run_json([
+                "web", "setup", "Human", "--password-stdin", "--json"
+            ])
+        self.assertEqual(0, setup_code)
+        run_dir = iam.ROOT / "run"
+        run_dir.mkdir(parents=True)
+        (run_dir / "web.instance").write_text("expected-instance\n", encoding="utf-8")
+        with (
+            patch("iam_orchestrator.read_pid", return_value=4321),
+            patch("iam_orchestrator.pid_alive", return_value=True),
+            patch("iam_orchestrator.web_available", return_value=False),
+        ):
+            code, payload = self.run_json(["web", "status", "--json"])
+
+        self.assertEqual(0, code)
+        self.assertFalse(payload["data"]["web"]["running"])
+        self.assertEqual(
+            "IAM_WEB_RUNTIME_IDENTITY_MISMATCH",
+            payload["data"]["web"]["error"]["code"],
+        )
+
+    def test_web_start_spawns_only_the_companion_process(self) -> None:
+        with patch("iam_orchestrator.sys.stdin", io.StringIO("correct horse battery staple\n")):
+            setup_code, _payload = self.run_json([
+                "web", "setup", "Human", "--password-stdin", "--json"
+            ])
+        self.assertEqual(0, setup_code)
+        with (
+            patch("iam_orchestrator.read_pid", return_value=None),
+            patch("iam_orchestrator.pid_alive", return_value=False),
+            patch("iam_orchestrator.spawn_background", return_value=4321) as spawn,
+            patch("iam_orchestrator.web_available", return_value=True),
+            patch("iam_orchestrator.ensure_appserver") as appserver,
+            patch("iam_orchestrator.ensure_daemon") as supervisor,
+        ):
+            code, payload = self.run_json(["web", "start", "--json"])
+
+        self.assertEqual(0, code)
+        self.assertEqual("started", payload["data"]["status"])
+        command = spawn.call_args.args[0]
+        self.assertIn("iam_web", command)
+        self.assertNotIn("app-server", command)
+        self.assertIn("--instance-token", command)
+        instance = command[command.index("--instance-token") + 1]
+        self.assertEqual(instance, (iam.ROOT / "run" / "web.instance").read_text(encoding="utf-8").strip())
+        appserver.assert_not_called()
+        supervisor.assert_not_called()
 
     def test_doctor_json_can_target_one_project(self) -> None:
         setup_project(self.project)

@@ -5,12 +5,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ctypes
+import getpass
+import hmac
+import http.client
 import importlib.metadata
 import json
 import logging
 import os
 import platform
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -24,6 +28,18 @@ from typing import Any
 import interagentmail as iam
 from iam_codex_bridge import AppServerClient, AppServerError, DeliveryState, MailboxBridge
 from iam_service import IAMService
+from iam_web import (
+    DEFAULT_PORT as DEFAULT_WEB_PORT,
+    LAN_WARNING,
+    WebError,
+    configure_web,
+    create_user_mailbox,
+    list_user_mailboxes,
+    load_web_config,
+    public_web_config,
+    update_password as update_web_password,
+    web_config_path,
+)
 
 
 LOG = logging.getLogger("iam.orchestrator")
@@ -300,6 +316,21 @@ def setup_project(
             )
         profile_before = loaded_profile
     profile_owner = str(profile_before.get("project_root", "")).strip()
+    profile_kind = profile_before.get("kind")
+    if box_existed and not profile_owner:
+        raise IAMCommandError(
+            "IAM_ADDRESS_COLLISION",
+            f"Mailbox address {address} already exists without project ownership; IAM will not migrate it implicitly.",
+            recoverable=True,
+            details={"address": address, "requested_project_root": str(root)},
+        )
+    if profile_owner and profile_kind == "user":
+        raise IAMCommandError(
+            "IAM_ADDRESS_COLLISION",
+            f"Mailbox address {address} is owned by a human user and cannot become a project identity.",
+            recoverable=True,
+            details={"address": address, "requested_project_root": str(root)},
+        )
     if profile_owner:
         try:
             mailbox_root = Path(profile_owner).expanduser().resolve()
@@ -343,6 +374,7 @@ def setup_project(
 
     iam.ensure_box(address)
     profile_data = iam.profile(address)
+    profile_data["kind"] = "project"
     profile_data["project_root"] = str(root)
     if display_name:
         profile_data["display_name"] = display_name
@@ -365,7 +397,7 @@ def setup_project(
         "approval_policy": approval_policy,
         "thread_state": "pinned" if state.thread_id else "pending",
         "thread_preserved": bool(state.thread_id),
-        "legacy_mailbox_reused": bool(box_existed and not profile_owner),
+        "legacy_mailbox_reused": False,
         "supervisor_reload": "automatic",
     }
 
@@ -399,6 +431,18 @@ def pid_path(name: str, *, create: bool = True) -> Path:
 
 def log_path(name: str, *, create: bool = True) -> Path:
     return runtime_dir(create=create) / f"{name}.log"
+
+
+def web_instance_path(*, create: bool = True) -> Path:
+    return runtime_dir(create=create) / "web.instance"
+
+
+def read_web_instance() -> str | None:
+    try:
+        value = web_instance_path(create=False).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value or None
 
 
 def read_pid(name: str) -> int | None:
@@ -634,6 +678,8 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "unregister": {"json": True, "preserves_mailbox": True},
             "status": {"json": True},
             "doctor": {"json": True, "project_filter": True},
+            "user": {"json": True, "mailbox_kind": "user"},
+            "web": {"json": True, "standalone_process": True, "authentication_required": True},
         },
         "features": {
             "collision_detection": True,
@@ -642,6 +688,10 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "automatic_supervisor_reload": True,
             "human_identity_required": False,
             "sanitized_support_reports": True,
+            "user_mailboxes": True,
+            "authenticated_web_interface": True,
+            "lan_access_opt_in": True,
+            "web_managed_by_iam_service": False,
         },
     }
     if getattr(args, "json_output", False):
@@ -650,6 +700,284 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
         print(f"InterAgentMail {data['iam_version']} integration schema {INTEGRATION_SCHEMA_VERSION}")
         print(f"Address strategy: {ADDRESS_STRATEGY}")
         print("Automation commands: capabilities, register, unregister, status, doctor")
+    return 0
+
+
+def raise_web_command_error(exc: WebError) -> None:
+    raise IAMCommandError(exc.code, exc.message, recoverable=exc.recoverable) from None
+
+
+def prompt_web_password(*, password_stdin: bool = False, confirm: bool = True) -> str:
+    if password_stdin:
+        password = sys.stdin.readline().rstrip("\r\n")
+        if not password:
+            raise IAMCommandError("IAM_WEB_PASSWORD_REQUIRED", "No password was received on standard input.", recoverable=True)
+        return password
+    password = getpass.getpass("Web application password: ")
+    if confirm:
+        repeated = getpass.getpass("Confirm web application password: ")
+        if password != repeated:
+            raise IAMCommandError("IAM_WEB_PASSWORD_MISMATCH", "The passwords did not match.", recoverable=True)
+    return password
+
+
+def cmd_user_create(args: argparse.Namespace) -> int:
+    try:
+        item = create_user_mailbox(args.address, args.display_name)
+    except WebError as exc:
+        raise_web_command_error(exc)
+    if getattr(args, "json_output", False):
+        print_json(integration_envelope({"user_mailbox": item}))
+    else:
+        print(f"User mailbox {item['display_name']} <{item['address']}> is {item['status']}.")
+        print(f"Mailbox data: {item['mailbox']}")
+    return 0
+
+
+def cmd_user_list(args: argparse.Namespace) -> int:
+    rows = list_user_mailboxes()
+    if getattr(args, "json_output", False):
+        print_json(integration_envelope({"user_mailboxes": rows}))
+    elif rows:
+        for row in rows:
+            print(f"{row['display_name']} <{row['address']}>")
+    else:
+        print("No user mailboxes. Run `iam user create ADDRESS`.")
+    return 0
+
+
+def web_available(port: int, timeout: float = 1.0, *, expected_instance: str | None = None) -> bool:
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request("GET", "/healthz", headers={"Host": f"127.0.0.1:{port}"})
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        if response.status != 200 or payload.get("service") != "iam-web":
+            return False
+        if expected_instance is None:
+            return True
+        return hmac.compare_digest(str(payload.get("instance", "")), expected_instance)
+    except (OSError, ValueError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
+def web_status_data() -> dict[str, Any]:
+    pid = read_pid("web")
+    process_alive = pid_alive(pid)
+    error: dict[str, Any] | None = None
+    try:
+        config = public_web_config(load_web_config()) if web_config_path().exists() else None
+    except WebError as exc:
+        config = None
+        error = {"code": exc.code, "message": exc.message, "recoverable": exc.recoverable}
+    instance = read_web_instance()
+    if process_alive and config and not instance and error is None:
+        error = {
+            "code": "IAM_WEB_RUNTIME_IDENTITY_MISSING",
+            "message": "The web process is live, but its runtime identity is missing.",
+            "recoverable": True,
+        }
+    running = bool(
+        process_alive
+        and config
+        and instance
+        and web_available(int(config["port"]), expected_instance=instance)
+    )
+    if process_alive and config and instance and not running and error is None:
+        error = {
+            "code": "IAM_WEB_RUNTIME_IDENTITY_MISMATCH",
+            "message": "The live process on the configured port does not match IAM's saved web instance.",
+            "recoverable": True,
+        }
+    return {
+        "configured": web_config_path().exists(),
+        "running": running,
+        "pid": pid if running else None,
+        "config": config,
+        "error": error,
+    }
+
+
+def cmd_web_setup(args: argparse.Namespace) -> int:
+    if pid_alive(read_pid("web")):
+        raise IAMCommandError(
+            "IAM_WEB_RUNNING",
+            "Stop only the web companion with `iam web stop` before changing its configuration.",
+            recoverable=True,
+        )
+    if args.lan and not args.acknowledge_network_risk:
+        raise IAMCommandError(
+            "IAM_WEB_LAN_ACK_REQUIRED",
+            LAN_WARNING + " Re-run with --acknowledge-network-risk to enable LAN access.",
+            recoverable=True,
+        )
+    try:
+        mailbox = create_user_mailbox(args.address, args.display_name)
+        config = configure_web(
+            mailbox["address"],
+            prompt_web_password(password_stdin=args.password_stdin),
+            port=args.port,
+            lan_enabled=args.lan,
+        )
+    except WebError as exc:
+        raise_web_command_error(exc)
+    data = {"user_mailbox": mailbox, "web": config}
+    if getattr(args, "json_output", False):
+        print_json(integration_envelope(data))
+    else:
+        print(f"Configured authenticated web access for {mailbox['display_name']} <{mailbox['address']}>.")
+        print(f"Default URL: http://{'PC_PRIVATE_IP' if config['lan_enabled'] else '127.0.0.1'}:{config['port']}")
+        if config["lan_enabled"]:
+            print(f"WARNING: {LAN_WARNING}")
+        print("Next: run `iam web start`. This does not restart IAM or Codex.")
+    return 0
+
+
+def cmd_web_password(args: argparse.Namespace) -> int:
+    if pid_alive(read_pid("web")):
+        raise IAMCommandError(
+            "IAM_WEB_RUNNING",
+            "Stop only the web companion with `iam web stop` before changing its password.",
+            recoverable=True,
+        )
+    try:
+        config = update_web_password(prompt_web_password(password_stdin=args.password_stdin))
+    except WebError as exc:
+        raise_web_command_error(exc)
+    if getattr(args, "json_output", False):
+        print_json(integration_envelope({"web": config, "password_updated": True}))
+    else:
+        print("The IAM web application password was updated.")
+    return 0
+
+
+def cmd_web_start(args: argparse.Namespace) -> int:
+    try:
+        config = load_web_config()
+    except WebError as exc:
+        raise_web_command_error(exc)
+    pid = read_pid("web")
+    if pid_alive(pid):
+        data = web_status_data()
+        if not data["running"]:
+            raise IAMCommandError(
+                "IAM_WEB_PID_CONFLICT",
+                "The saved web PID belongs to a live process, but the configured IAM web health check failed. "
+                "IAM will not stop or replace an unidentified process.",
+                recoverable=True,
+            )
+        if getattr(args, "json_output", False):
+            print_json(integration_envelope({"web": data, "status": "already_running"}))
+        else:
+            print(f"IAM web companion is already running (pid {pid}).")
+        return 0
+    for stale_path in (pid_path("web"), web_instance_path()):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    lan_enabled = bool(config.get("lan_enabled"))
+    host = "0.0.0.0" if lan_enabled else "127.0.0.1"
+    port = int(config["port"])
+    instance = secrets.token_urlsafe(32)
+    command = [
+        sys.executable,
+        "-m",
+        "iam_web",
+        "--config",
+        str(web_config_path()),
+        "--host",
+        host,
+        "--port",
+        str(port),
+        "--instance-token",
+        instance,
+    ]
+    pid = spawn_background(command, "web")
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        if web_available(port, expected_instance=instance):
+            instance_file = web_instance_path()
+            instance_file.write_text(instance + "\n", encoding="utf-8")
+            if os.name != "nt":
+                instance_file.chmod(0o600)
+            data = {
+                "configured": True,
+                "running": True,
+                "pid": pid,
+                "config": {**public_web_config(config), "port": port, "lan_enabled": lan_enabled},
+            }
+            if getattr(args, "json_output", False):
+                print_json(integration_envelope({"web": data, "status": "started"}))
+            else:
+                print(f"IAM web companion started (pid {pid}).")
+                print(f"Open http://127.0.0.1:{port} on this PC.")
+                if lan_enabled:
+                    print(f"LAN devices may use this PC's private network address on port {port}.")
+                    print(f"WARNING: {LAN_WARNING}")
+                print("The IAM supervisor and Codex app-server were not restarted.")
+            return 0
+        if not pid_alive(pid):
+            break
+    if pid_alive(pid):
+        stop_process(pid, tree=True)
+    for stale_path in (pid_path("web", create=False), web_instance_path(create=False)):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
+    raise IAMCommandError(
+        "IAM_WEB_START_FAILED",
+        f"IAM web companion did not start. See {log_path('web')}",
+        recoverable=True,
+    )
+
+
+def cmd_web_status(args: argparse.Namespace) -> int:
+    data = web_status_data()
+    if getattr(args, "json_output", False):
+        print_json(integration_envelope({"web": data}))
+        return 0
+    if not data["configured"]:
+        print("IAM web companion is not configured. Run `iam web setup USER_MAILBOX`.")
+        return 0
+    if data["error"]:
+        print(f"IAM web companion configuration is invalid: {data['error']['message']}")
+        return 1
+    config = data["config"]
+    print(f"IAM web companion: {'running' if data['running'] else 'stopped'}")
+    print(f"User mailbox:       {config['mailbox']}")
+    print(f"Access:             {'local network' if config['lan_enabled'] else 'this PC only'}")
+    print(f"Port:               {config['port']}")
+    return 0
+
+
+def cmd_web_stop(args: argparse.Namespace) -> int:
+    pid = read_pid("web")
+    if pid_alive(pid):
+        status = web_status_data()
+        if not status["running"]:
+            raise IAMCommandError(
+                "IAM_WEB_PID_CONFLICT",
+                "The saved web PID belongs to a live process, but the configured IAM web health check failed. "
+                "IAM will not terminate an unidentified process.",
+                recoverable=True,
+            )
+        assert pid is not None
+        stop_process(pid, tree=True)
+        print(f"Stopped IAM web companion process tree {pid}.")
+    else:
+        print("IAM web companion is not running.")
+    for stale_path in (pid_path("web", create=False), web_instance_path(create=False)):
+        try:
+            stale_path.unlink()
+        except FileNotFoundError:
+            pass
+    print("The IAM supervisor and Codex app-server were left running.")
     return 0
 
 
@@ -874,6 +1202,32 @@ def collect_diagnostics(
     else:
         add(CHECK_WARN, "IAM supervisor", "stopped; run `iam start` when delivery is needed")
 
+    web_configured = web_config_path().exists()
+    web_running = False
+    web_lan_enabled = False
+    if web_configured:
+        try:
+            web_config = load_web_config()
+            web_lan_enabled = bool(web_config.get("lan_enabled"))
+            web_state = web_status_data()
+            web_running = bool(web_state["running"])
+            if web_state["error"]:
+                add(CHECK_FAIL, "IAM web companion", f"runtime is invalid: {web_state['error']['message']}")
+            elif web_lan_enabled:
+                add(
+                    CHECK_WARN,
+                    "IAM web companion",
+                    "LAN access is enabled; use only a trusted WPA2/WPA3 network and never forward the port",
+                )
+            elif web_running:
+                add(CHECK_PASS, "IAM web companion", "authenticated local-only interface is running")
+            else:
+                add(CHECK_WARN, "IAM web companion", "configured but stopped; run `iam web start` when browser access is needed")
+        except WebError as exc:
+            add(CHECK_FAIL, "IAM web companion", f"configuration is invalid: {exc}")
+    else:
+        add(CHECK_PASS, "IAM web companion", "not configured (optional)")
+
     project_rows: list[dict[str, Any]] = []
     for address, entry in sorted(projects.items()):
         if not isinstance(entry, dict):
@@ -989,6 +1343,9 @@ def collect_diagnostics(
             "url": url,
             "appserver_reachable": server_reachable,
             "supervisor_running": supervisor_running,
+            "web_configured": web_configured,
+            "web_running": web_running,
+            "web_lan_enabled": web_lan_enabled,
         },
         "target_project": str(target_root) if target_root else None,
         "projects": project_rows,
@@ -996,6 +1353,7 @@ def collect_diagnostics(
         "logs": {
             "supervisor": summarize_log("supervisor", log_lines),
             "app-server": summarize_log("app-server", log_lines),
+            "web": summarize_log("web", log_lines),
         },
     }
 
@@ -1062,6 +1420,9 @@ def render_report(diagnostics: dict[str, Any]) -> str:
         f"- App-server endpoint: {services['url'] if services['url'].startswith(('ws://127.0.0.1:', 'ws://localhost:')) else '<CUSTOM_APP_SERVER_URL>'}",
         f"- App-server reachable: {'yes' if services['appserver_reachable'] else 'no'}",
         f"- Supervisor running: {'yes' if services['supervisor_running'] else 'no'}",
+        f"- Web companion configured: {'yes' if services.get('web_configured') else 'no'}",
+        f"- Web companion running: {'yes' if services.get('web_running') else 'no'}",
+        f"- Web companion LAN access: {'yes' if services.get('web_lan_enabled') else 'no'}",
         "",
         "## Health checks",
         "",
@@ -1202,6 +1563,7 @@ def collect_status(url: str = DEFAULT_URL) -> dict[str, Any]:
         appserver_reachable = False
     supervisor_pid = read_pid("supervisor")
     supervisor_running = pid_alive(supervisor_pid)
+    web = web_status_data()
     project_rows: list[dict[str, Any]] = []
     for address, entry in sorted(projects.items()):
         if not isinstance(entry, dict):
@@ -1227,6 +1589,7 @@ def collect_status(url: str = DEFAULT_URL) -> dict[str, Any]:
         "services": {
             "appserver": {"reachable": appserver_reachable, "url": url},
             "supervisor": {"running": supervisor_running, "pid": supervisor_pid if supervisor_running else None},
+            "web": web,
         },
         "projects": project_rows,
     }
@@ -1244,6 +1607,14 @@ def cmd_status(args: argparse.Namespace) -> int:
         f"Supervisor: {'running' if supervisor['running'] else 'stopped'}"
         + (f" (pid {supervisor['pid']})" if supervisor["pid"] else "")
     )
+    web = services["web"]
+    if web["error"]:
+        print(f"Web:        invalid configuration ({web['error']['code']})")
+    else:
+        print(
+            f"Web:        {'running' if web['running'] else 'stopped' if web['configured'] else 'not configured'}"
+            + (f" ({'LAN' if web['config']['lan_enabled'] else 'this PC only'}, port {web['config']['port']})" if web["config"] else "")
+        )
     if not status["projects"]:
         print("Projects:   none; run `iam setup`")
         return 0
@@ -1324,6 +1695,43 @@ def parser() -> argparse.ArgumentParser:
     capabilities = sub.add_parser("capabilities", help="Describe IAM's stable automation interface.")
     capabilities.add_argument("--json", action="store_true", dest="json_output")
     capabilities.set_defaults(func=cmd_capabilities)
+
+    user = sub.add_parser("user", help="Create and inspect human IAM mailboxes.")
+    user_sub = user.add_subparsers(dest="user_command", required=True)
+    user_create = user_sub.add_parser("create", help="Create or update a human mailbox.")
+    user_create.add_argument("address", help="Unique mailbox address used as the sender identity.")
+    user_create.add_argument("--display-name", help="Optional human-facing name; defaults to the address.")
+    user_create.add_argument("--json", action="store_true", dest="json_output")
+    user_create.set_defaults(func=cmd_user_create)
+    user_list = user_sub.add_parser("list", help="List human IAM mailboxes.")
+    user_list.add_argument("--json", action="store_true", dest="json_output")
+    user_list.set_defaults(func=cmd_user_list)
+
+    web = sub.add_parser("web", help="Manage the standalone authenticated browser interface.")
+    web_sub = web.add_subparsers(dest="web_command", required=True)
+    web_setup = web_sub.add_parser("setup", help="Create a user mailbox and configure authenticated web access.")
+    web_setup.add_argument("address", help="User mailbox address to create or use.")
+    web_setup.add_argument("--display-name", help="Optional human-facing name; defaults to the address.")
+    web_setup.add_argument("--port", type=int, default=DEFAULT_WEB_PORT)
+    web_setup.add_argument("--lan", action="store_true", help="Allow access from the local network instead of only this PC.")
+    web_setup.add_argument("--acknowledge-network-risk", action="store_true", help="Confirm the LAN security warning.")
+    web_setup.add_argument("--password-stdin", action="store_true", help="Read the password from standard input for automation.")
+    web_setup.add_argument("--json", action="store_true", dest="json_output")
+    web_setup.set_defaults(func=cmd_web_setup)
+
+    web_start = web_sub.add_parser("start", help="Start only the configured standalone web companion in the background.")
+    web_start.add_argument("--json", action="store_true", dest="json_output")
+    web_start.set_defaults(func=cmd_web_start)
+
+    web_status = web_sub.add_parser("status", help="Show standalone web companion status.")
+    web_status.add_argument("--json", action="store_true", dest="json_output")
+    web_status.set_defaults(func=cmd_web_status)
+    web_stop = web_sub.add_parser("stop", help="Stop only the standalone web companion.")
+    web_stop.set_defaults(func=cmd_web_stop)
+    web_password = web_sub.add_parser("password", help="Change the web application password while the companion is stopped.")
+    web_password.add_argument("--password-stdin", action="store_true", help="Read the password from standard input for automation.")
+    web_password.add_argument("--json", action="store_true", dest="json_output")
+    web_password.set_defaults(func=cmd_web_password)
 
     def add_registration_arguments(command: argparse.ArgumentParser) -> None:
         command.add_argument("projects", nargs="*", help="Project folders. Defaults to the current folder.")

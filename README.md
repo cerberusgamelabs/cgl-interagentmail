@@ -36,6 +36,28 @@ iam open
 
 The complete Windows, macOS, Linux, upgrade, troubleshooting, and uninstall instructions are in [docs/INSTALL.md](docs/INSTALL.md).
 
+## Browser messaging
+
+Version 1.3 adds an authenticated browser surface backed by an ordinary human IAM mailbox. Agent replies return to the same inbox, and messages queue normally when agents or delivery services are offline.
+
+Configure the default this-PC-only interface, choose a password when prompted, and start only its standalone companion process:
+
+```console
+iam web setup MyMailbox --display-name "My Name"
+iam web start
+```
+
+Open `http://127.0.0.1:8787`. This does not start, stop, or restart the IAM supervisor or Codex app-server. Use `iam web status`, `iam web password`, and `iam web stop` for its lifecycle.
+
+LAN access is an explicit opt-in:
+
+```console
+iam web setup MyMailbox --display-name "My Name" --lan --acknowledge-network-risk
+iam web start
+```
+
+LAN mode uses plain HTTP plus application-password authentication; it is not end-to-end encrypted. Enable it only on a trusted, password-protected WPA2/WPA3 network, allow only Private networks in the operating-system firewall, keep the password private, and never port-forward the IAM web port. Anyone who gains access can read messages, send agent instructions, and potentially cause project changes or corruption.
+
 Source code, releases, and issue tracking are hosted at <https://github.com/cerberusgamelabs/cgl-interagentmail>.
 
 ## Everyday commands
@@ -44,6 +66,10 @@ Source code, releases, and issue tracking are hosted at <https://github.com/cerb
 iam status
 iam doctor
 iam report
+iam user create ADDRESS
+iam web setup ADDRESS
+iam web start
+iam web status
 iam open [PROJECT]
 iam restart
 iam stop
@@ -56,6 +82,7 @@ iam capabilities --json
 - `iam status` shows services, projects, and pinned thread IDs; `--json` provides stable schema 1.0 output.
 - `iam doctor` runs read-only health checks for IAM, Codex, services, project registration, MCP configuration, mailboxes, safety policy, and resumable threads.
 - `iam report` creates a privacy-sanitized Markdown support report under the IAM data directory.
+- `iam user` manages human mailboxes; `iam web` manages the separate authenticated browser companion.
 - `iam open` resumes the exact thread owned by the current or named project.
 - `iam stop` stops mail delivery but leaves the shared app-server running.
 - `iam stop --all` stops both IAM-managed background services.
@@ -120,7 +147,7 @@ Only for a trusted project that genuinely requires unrestricted filesystem and n
 iam setup "C:\Projects\SecurityReviewer" --full-access
 ```
 
-InterAgentMail is a local coordination mechanism, not an authentication boundary. Any local process that can write to its data directory can inject or modify mail. Do not share that directory with untrusted users or accept untrusted message content as instructions.
+The browser interface has application-level password authentication, CSRF protection, login throttling, and restrictive browser headers. Its LAN transport is still plain HTTP and must be treated as trusted-network-only. InterAgentMail's file-backed core is a local coordination mechanism, not an authentication boundary. Any local process that can write to its data directory can inject or modify mail. Do not share that directory with untrusted users or accept untrusted message content as instructions.
 
 ## Sending mail
 

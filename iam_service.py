@@ -33,22 +33,35 @@ def _as_list(values: list[str] | None) -> list[str]:
 
 
 class IAMService:
-    """IAM operations bound to one project identity.
+    """IAM operations bound to one trusted project or application mailbox.
 
-    Binding the project root at server startup prevents an MCP caller from
-    impersonating another mailbox by supplying an arbitrary project path.
+    Binding identity at startup prevents an MCP or browser caller from
+    impersonating another mailbox through request parameters.
     """
 
-    def __init__(self, project_root: str | Path | None = None) -> None:
-        self.project_root = Path(project_root or Path.cwd()).resolve()
+    def __init__(
+        self,
+        project_root: str | Path | None = None,
+        *,
+        mailbox_address: str | None = None,
+    ) -> None:
+        self.project_root = Path(project_root or Path.cwd()).resolve() if mailbox_address is None else None
         with translated_errors():
-            self.address = iam.address(str(self.project_root))
+            self.address = iam.address(str(self.project_root)) if mailbox_address is None else iam.safe_segment(
+                mailbox_address,
+                "mailbox address",
+            )
             iam.ensure_box(self.address)
+
+    @classmethod
+    def for_mailbox(cls, mailbox_address: str) -> "IAMService":
+        """Bind trusted local application code to a non-project mailbox."""
+        return cls(mailbox_address=mailbox_address)
 
     def whoami(self) -> dict[str, Any]:
         with translated_errors():
             data = iam.profile(self.address)
-        return {**data, "project_root": str(self.project_root)}
+        return {**data, "project_root": str(self.project_root) if self.project_root else None}
 
     def list_mailboxes(self) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
@@ -62,8 +75,22 @@ class IAMService:
             result.append({
                 "address": str(data.get("address") or box.name),
                 "display_name": str(data.get("display_name") or box.name),
+                "kind": str(data.get("kind") or ("project" if data.get("project_root") else "mailbox")),
             })
         return result
+
+    def list_messages(self, folder: str = "inbox", limit: int = 100) -> list[dict[str, Any]]:
+        if folder not in {"inbox", "sent", "archive"}:
+            raise IAMError("folder must be inbox, sent, or archive")
+        if limit < 1 or limit > 1000:
+            raise IAMError("limit must be between 1 and 1000")
+        rows: list[dict[str, Any]] = []
+        with translated_errors():
+            for path in reversed(iam.messages(self.address, folder)):
+                rows.append(iam.load(path))
+                if len(rows) >= limit:
+                    break
+        return rows
 
     def inbox(self, unread_only: bool = False, limit: int = 100) -> list[dict[str, Any]]:
         if limit < 1 or limit > 1000:

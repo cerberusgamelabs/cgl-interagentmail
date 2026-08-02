@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.3.0 - 2026-08-02
+
+- Added explicit human IAM mailboxes that use the same durable send, reply, read, and archive flow as project agents, with mutually exclusive human/project ownership.
+- Added an authenticated, dependency-free browser inbox with responsive compose, inbox, sent, archive, and reply views.
+- Added secure local defaults, salted PBKDF2 password storage, expiring IP-bound sessions, CSRF and same-origin checks, login throttling, request limits, host validation, and restrictive browser headers.
+- Added opt-in same-network access with an explicit warning for trusted WPA2/WPA3 networks; LAN HTTP is not end-to-end encrypted and must never be exposed to public networks or port forwarding.
+- Added standalone `iam user` and `iam web` lifecycle commands plus health, status, capability, and sanitized-report coverage without restarting the IAM supervisor or Codex app-server.
+- Reserved service-managed web lifecycle for v1.3.1 while keeping v1.3.0 fully usable as a standalone companion.
+
 ## 1.2.0 - 2026-07-29
 
 - Added a stable schema 1.0 JSON integration interface through `iam capabilities`, `iam register`, `iam unregister`, `iam status`, and project-scoped `iam doctor`.

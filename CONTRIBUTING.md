@@ -17,6 +17,8 @@ python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
+Changes to `iam_web.py` must include tests for authentication boundaries, CSRF/origin enforcement, mailbox authorization, and request validation. Do not use real mailbox data or restart a developer's running IAM services during tests.
+
 On Windows, activate the virtual environment or invoke `.venv\Scripts\python.exe` directly. On macOS/Linux, use `.venv/bin/python`.
 
 ## Pull requests

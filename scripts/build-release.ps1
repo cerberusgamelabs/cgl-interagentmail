@@ -50,7 +50,7 @@ if ($packages.Count -ne 2) {
 & $pythonCommand -m twine check @($packages.FullName)
 if ($LASTEXITCODE -ne 0) { throw "Twine package validation failed." }
 
-$forbidden = "(^|/)(mailboxes|chats|run|DEV|InterAgentChatReader|\.venv)(/|$)|(^|/)config\.json$"
+$forbidden = "(^|/)(mailboxes|chats|run|DEV|InterAgentChatReader|\.venv)(/|$)|(^|/)(config|web)\.json$"
 foreach ($package in $packages) {
     if ($package.Extension -eq ".whl") {
         $listing = & $pythonCommand -m zipfile -l $package.FullName

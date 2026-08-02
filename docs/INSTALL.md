@@ -70,14 +70,14 @@ iam --help
 The signed-off GitHub release wheel is also available as a direct-install fallback:
 
 ```cmd
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.2.0/cgl_interagentmail-1.2.0-py3-none-any.whl
+pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.3.0/cgl_interagentmail-1.3.0-py3-none-any.whl
 iam --help
 ```
 
 To install a wheel downloaded directly from Cerberus Game Labs instead, use its actual downloaded path:
 
 ```cmd
-pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.2.0-py3-none-any.whl"
+pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.3.0-py3-none-any.whl"
 iam --help
 ```
 
@@ -187,6 +187,41 @@ Open other agents in other terminal tabs. They share the same app-server but ret
 
 If the receiving Codex UI is closed, the background supervisor can still wake its saved thread and perform work. If a task requires interactive approval, it fails closed; open that agent to review the request.
 
+## Human mailbox and browser interface
+
+The browser is optional. It uses an ordinary IAM mailbox for your identity, so agents receive normal mail and their replies appear in your browser inbox. First configure the safe default, which listens only on this computer:
+
+```cmd
+iam web setup MyMailbox --display-name "My Name"
+iam web start
+```
+
+Enter and confirm a password of at least 12 characters when prompted. IAM stores a salted PBKDF2 password digest, not the password. Open <http://127.0.0.1:8787>, then select any existing agent mailbox, write a subject and request, and send it. If `iam start` is running, registered agents wake automatically; otherwise the request remains queued.
+
+The web companion is independent:
+
+```cmd
+iam web status
+iam web stop
+iam web password
+iam web start
+```
+
+Changing the password or network configuration requires only `iam web stop`; neither `iam` delivery nor the Codex app-server is restarted. In v1.3.0 this is deliberately a standalone companion. Service-managed web lifecycle is planned for v1.3.1.
+
+To let another device on the same network connect, stop the web companion if needed and explicitly opt in:
+
+```cmd
+iam web setup MyMailbox --display-name "My Name" --lan --acknowledge-network-risk
+iam web start
+```
+
+On the other device, browse to `http://PC_PRIVATE_IP:8787`. A Windows firewall prompt may appear on first use; allow Private networks only, never Public networks. You may need to find the host PC's private IPv4 address with `ipconfig` on Windows or `ip addr`/`ifconfig` on macOS or Linux.
+
+> LAN mode uses HTTP and is not end-to-end encrypted. Use it only on a trusted, password-protected WPA2/WPA3 network. Do not enable it on open Wi-Fi, public, guest, dormitory, hotel, cafe, or other untrusted networks. Keep the application password private and never expose or port-forward port 8787. Anyone who captures the password or gains access can read mail, send instructions to agents, and potentially modify or corrupt projects.
+
+`iam user create ADDRESS --display-name "Name"` can create a human mailbox without enabling the browser. `iam user list` shows human mailboxes.
+
 ## Existing mail and offline behavior
 
 Mail remains queued on disk while IAM is stopped. On first setup, existing messages become a baseline and only later messages wake the agent. To deliberately process the pre-existing inbox:
@@ -265,7 +300,7 @@ By default the report is written under the IAM data directory's `reports` folder
 
 Use `iam report --output PATH` to choose a destination or `iam report --stdout` to print it. IAM refuses to replace an existing output file unless `--force` is provided. After reviewing the diagnosis, `iam restart` remains the usual way to restart both managed background services.
 
-Logs are under `run/app-server.log` and `run/supervisor.log` inside the IAM data directory.
+Logs are under `run/app-server.log`, `run/supervisor.log`, and, when configured, `run/web.log` inside the IAM data directory.
 
 Common issues:
 
@@ -276,5 +311,7 @@ Common issues:
 - **Work waits for approval:** open the receiving project with `iam open` and review the request. IAM never grants an unattended approval automatically.
 - **An old bridge is also running:** stop manually launched `IAMBridge` or `iam-codex-bridge` processes; the supervisor replaces them.
 - **A thread cannot resume:** run `iam restart`. The supervisor creates and persists a replacement thread when the saved one no longer exists.
+- **The browser does not open:** run `iam web status`, then inspect `run/web.log`; `iam web start` does not start agent delivery.
+- **A laptop cannot connect:** confirm LAN mode is configured, use the host PC's private IP, and allow the port on Private networks only. Never weaken a Public-network firewall to make it work.
 
 For support, open an issue at <https://github.com/cerberusgamelabs/cgl-interagentmail/issues> and attach the output from `iam report` after reviewing it. Report suspected vulnerabilities privately as described in <https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/SECURITY.md>.

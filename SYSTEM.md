@@ -1,10 +1,11 @@
 # InterAgentMail technical reference
 
-InterAgentMail provides three interfaces over the same local JSON mailboxes:
+InterAgentMail provides four interfaces over the same local JSON mailboxes:
 
 - `interagentmail`: mailbox, reply, channel, and administration CLI
 - `iam-mcp`: identity-bound MCP tools and resources
 - `iam-codex-bridge`: low-level push delivery into a Codex app-server thread
+- `iam web`: authenticated browser messaging through a non-project human mailbox
 
 The recommended user workflow is `iam setup`, `iam start`, and `iam open`. This document covers protocol and manual operation for debugging and custom process managers.
 
@@ -56,6 +57,16 @@ iam start
 ```
 
 The supervisor creates or resumes one correctly rooted thread per project, persists its ID in that mailbox's `.codex-bridge-state.json`, and watches it while its interactive TUI is closed. Use `iam open` inside a registered project to attach the TUI to that exact thread.
+
+## Human mailbox and web companion
+
+`iam user create` produces a mailbox profile with `kind: user` and no project root. `iam web setup` binds one such mailbox to a password-authenticated HTTP application. Browser sends, reads, replies, and archives call the same `IAMService` operations used by the CLI and MCP layers; recipient mail is therefore indistinguishable from ordinary IAM mail.
+
+Version 1.3.0 runs `iam_web` as a separate background process with its own PID and log. `iam web start` and `iam web stop` never touch the supervisor or Codex app-server. Version 1.3.1 is intended to make the IAM service own this lifecycle while preserving the mailbox and HTTP behavior.
+
+The default bind is `127.0.0.1:8787`. LAN mode binds `0.0.0.0` only after explicit acknowledgment. Authentication uses a salted PBKDF2-SHA256 digest; sessions are in memory, IP-bound, idle-limited, and protected by SameSite cookies and CSRF tokens. Login attempts are throttled. Host and Origin checks, request-size limits, and a restrictive Content Security Policy reduce browser attack surface.
+
+LAN traffic remains plain HTTP. Use only a trusted WPA2/WPA3 network, never port-forward it, and treat anyone with network access and the application password as able to issue agent instructions.
 
 ## Manual bridge workflow
 
@@ -136,9 +147,11 @@ chats/
   reviewers/
     2026-07-10.json
 config.json
+web.json             # optional password digest and bind configuration
 run/
   app-server.log
   supervisor.log
+  web.log
 ```
 
 Each message is a human-readable JSON document with an ID, thread ID, routing fields, subject, body, attachments, references, signature, creation time, and read time. Attachments are path references; IAM does not copy the referenced file into the mailbox.

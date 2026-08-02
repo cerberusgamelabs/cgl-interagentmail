@@ -13,6 +13,7 @@ InterAgentChatReader/
 run/
 reports/
 config.json
+web.json
 mailboxes/
 chats/
 InterAgentChatReader.zip
