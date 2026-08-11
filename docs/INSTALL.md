@@ -70,14 +70,14 @@ iam --help
 The signed-off GitHub release wheel is also available as a direct-install fallback:
 
 ```cmd
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.3.0/cgl_interagentmail-1.3.0-py3-none-any.whl
+pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.3.1/cgl_interagentmail-1.3.1-py3-none-any.whl
 iam --help
 ```
 
 To install a wheel downloaded directly from Cerberus Game Labs instead, use its actual downloaded path:
 
 ```cmd
-pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.3.0-py3-none-any.whl"
+pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.3.1-py3-none-any.whl"
 iam --help
 ```
 
@@ -161,7 +161,7 @@ Run this once after signing in or rebooting:
 iam start
 ```
 
-`iam start` launches one local Codex app-server and one IAM supervisor in the background. It does not open one terminal per agent. Running it again is harmless.
+`iam start` launches one local Codex app-server and one IAM supervisor in the background. The supervisor watches every registered mailbox but opens an isolated app-server connection only when a mailbox has undelivered mail. It retains that connection while a turn is active or awaiting approval, then releases it after the turn is idle. It does not open one terminal per agent. Running it again is harmless.
 
 Check everything with:
 
@@ -183,7 +183,7 @@ Or name the folder from anywhere:
 iam open "C:\Projects\SecurityReviewer"
 ```
 
-Open other agents in other terminal tabs. They share the same app-server but retain separate project folders, mailboxes, and Codex threads.
+Open other agents in other terminal tabs. They share the same app-server but retain separate project folders, mailboxes, and Codex threads. Background delivery uses isolated temporary connections, so one unavailable project does not prevent the others from receiving mail.
 
 If the receiving Codex UI is closed, the background supervisor can still wake its saved thread and perform work. If a task requires interactive approval, it fails closed; open that agent to review the request.
 
@@ -207,7 +207,7 @@ iam web password
 iam web start
 ```
 
-Changing the password or network configuration requires only `iam web stop`; neither `iam` delivery nor the Codex app-server is restarted. In v1.3.0 this is deliberately a standalone companion. Service-managed web lifecycle is planned for v1.3.1.
+Changing the password or network configuration requires only `iam web stop`; neither `iam` delivery nor the Codex app-server is restarted. In v1.3.1 this is deliberately a standalone companion. Service-managed web lifecycle remains planned for a future release.
 
 To let another device on the same network connect, stop the web companion if needed and explicitly opt in:
 
@@ -306,7 +306,7 @@ Common issues:
 
 - **`iam` is not recognized:** close and reopen the terminal after `pipx ensurepath`; then run `py -m pipx ensurepath` again if needed.
 - **Codex was not found:** verify `codex --version` in the same terminal and complete the Codex sign-in flow.
-- **A mailbox does not wake:** confirm its project appears in `iam status`; then check `supervisor.log`.
+- **A mailbox does not wake:** confirm its project appears in `iam status`; then check `supervisor.log`. Each new message activates only that mailbox's temporary delivery connection, so other projects remain unaffected by a failed attachment.
 - **Port 4500 is occupied:** stop an old manual `codex app-server` or use a consistent custom `--url` with IAM commands.
 - **Work waits for approval:** open the receiving project with `iam open` and review the request. IAM never grants an unattended approval automatically.
 - **An old bridge is also running:** stop manually launched `IAMBridge` or `iam-codex-bridge` processes; the supervisor replaces them.

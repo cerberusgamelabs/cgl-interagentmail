@@ -56,13 +56,13 @@ Then start the shared services:
 iam start
 ```
 
-The supervisor creates or resumes one correctly rooted thread per project, persists its ID in that mailbox's `.codex-bridge-state.json`, and watches it while its interactive TUI is closed. Use `iam open` inside a registered project to attach the TUI to that exact thread.
+The supervisor watches every registered mailbox while its interactive TUI is closed, but it creates or resumes a correctly rooted thread only when that mailbox has undelivered mail. Each active mailbox receives its own app-server connection; IAM retains it while the turn is active or awaiting approval and releases it once idle. This avoids loading inactive projects and isolates one failed thread from other delivery. Use `iam open` inside a registered project to resume its saved thread or start a new remote session when it has not yet been pinned.
 
 ## Human mailbox and web companion
 
 `iam user create` produces a mailbox profile with `kind: user` and no project root. `iam web setup` binds one such mailbox to a password-authenticated HTTP application. Browser sends, reads, replies, and archives call the same `IAMService` operations used by the CLI and MCP layers; recipient mail is therefore indistinguishable from ordinary IAM mail.
 
-Version 1.3.0 runs `iam_web` as a separate background process with its own PID and log. `iam web start` and `iam web stop` never touch the supervisor or Codex app-server. Version 1.3.1 is intended to make the IAM service own this lifecycle while preserving the mailbox and HTTP behavior.
+Version 1.3.1 runs `iam_web` as a separate background process with its own PID and log. `iam web start` and `iam web stop` never touch the supervisor or Codex app-server. Service-managed web lifecycle remains reserved for a future release while preserving the mailbox and HTTP behavior.
 
 The default bind is `127.0.0.1:8787`. LAN mode binds `0.0.0.0` only after explicit acknowledgment. Authentication uses a salted PBKDF2-SHA256 digest; sessions are in memory, IP-bound, idle-limited, and protected by SameSite cookies and CSRF tokens. Login attempts are throttled. Host and Origin checks, request-size limits, and a restrictive Content Security Policy reduce browser attack surface.
 

@@ -12,7 +12,8 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import interagentmail as iam
-from iam_codex_bridge import DeliveryState
+from iam_codex_bridge import AppServerError, DeliveryState
+from iam_service import IAMService
 from iam_orchestrator import (
     CHECK_FAIL,
     INTEGRATION_SCHEMA_VERSION,
@@ -486,6 +487,7 @@ class DiagnosticCommandTests(unittest.TestCase):
 
 class FakeSupervisorClient:
     instances: list["FakeSupervisorClient"] = []
+    failing_cwds: set[str] = set()
 
     def __init__(self, url: str, **_kwargs: Any) -> None:
         self.url = url
@@ -502,14 +504,20 @@ class FakeSupervisorClient:
 
     async def request(self, method: str, params: dict[str, Any]) -> Any:
         self.calls.append((method, params))
+        cwd = str(params.get("cwd", ""))
+        if cwd in self.failing_cwds:
+            raise AppServerError("simulated mailbox attachment failure")
         if method == "thread/list":
+            if self.created:
+                return {"data": [{"id": "supervised-thread", "status": {"type": "idle"}}]}
             return {"data": []}
         if method == "thread/start":
             self.created = True
             return {"thread": {"id": "supervised-thread", "status": {"type": "idle"}}}
+        if method == "thread/read":
+            return {"thread": {"id": params["threadId"], "status": {"type": "idle"}}}
         if method == "turn/start":
-            self.closed.set()
-            return {"turn": {"id": "bootstrap-turn", "status": "inProgress"}}
+            return {"turn": {"id": "delivery-turn", "status": "inProgress"}}
         raise AssertionError(f"Unexpected method {method}")
 
 
@@ -526,17 +534,39 @@ class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.project.mkdir()
         setup_project(self.project)
         FakeSupervisorClient.instances.clear()
+        FakeSupervisorClient.failing_cwds.clear()
 
     async def asyncTearDown(self) -> None:
         iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.CONFIG = self.old_paths
         self.temp.cleanup()
 
-    async def test_supervisor_creates_and_pins_safe_project_thread(self) -> None:
+    def baseline(self, project: Path) -> None:
+        service = IAMService(project)
+        state = DeliveryState.load(iam.mailbox(service.address) / ".codex-bridge-state.json")
+        state.initialize(service.inbox(), process_existing=False)
+
+    async def test_supervisor_is_lazy_until_mail_arrives(self) -> None:
         with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient):
-            await serve_once("ws://127.0.0.1:4500")
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+
+        self.assertEqual([], FakeSupervisorClient.instances)
+        state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        self.assertIsNone(state.thread_id)
+
+    async def test_supervisor_creates_and_pins_thread_only_for_new_mail(self) -> None:
+        self.baseline(self.project)
+        sender_root = self.root / "Sender"
+        sender_root.mkdir()
+        sender = IAMService(sender_root)
+        message = sender.send(["SupervisedProject"], "Review", "Please review this project.")
+
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
 
         state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
         self.assertEqual("supervised-thread", state.thread_id)
+        self.assertTrue(state.is_delivered(message["id"]))
+        self.assertEqual(1, len(FakeSupervisorClient.instances))
         start = next(
             params
             for method, params in FakeSupervisorClient.instances[0].calls
@@ -545,13 +575,32 @@ class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(self.project.resolve()), start["cwd"])
         self.assertEqual("workspace-write", start["sandbox"])
         self.assertEqual("on-request", start["approvalPolicy"])
-        bootstrap = next(
+        delivery = next(
             params
             for method, params in FakeSupervisorClient.instances[0].calls
             if method == "turn/start"
         )
-        self.assertEqual("supervised-thread", bootstrap["threadId"])
-        self.assertIn("InterAgentMail ready", bootstrap["input"][0]["text"])
+        self.assertIn(message["id"], delivery["input"][0]["text"])
+
+    async def test_failed_mailbox_does_not_block_other_mailboxes(self) -> None:
+        broken_root = self.root / "BrokenProject"
+        sender_root = self.root / "Sender"
+        broken_root.mkdir()
+        sender_root.mkdir()
+        setup_project(broken_root)
+        self.baseline(self.project)
+        self.baseline(broken_root)
+        sender = IAMService(sender_root)
+        delivered = sender.send(["SupervisedProject"], "Review", "Deliver this.")
+        sender.send(["BrokenProject"], "Review", "This attachment will fail.")
+        FakeSupervisorClient.failing_cwds.add(str(broken_root.resolve()))
+
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+
+        state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        self.assertTrue(state.is_delivered(delivered["id"]))
+        self.assertGreaterEqual(len(FakeSupervisorClient.instances), 2)
 
 
 if __name__ == "__main__":

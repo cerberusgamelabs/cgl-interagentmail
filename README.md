@@ -4,7 +4,7 @@
 
 InterAgentMail gives local Codex project agents durable mailboxes, MCP tools, and automatic wake-up delivery. Messages are stored as JSON on disk, so they remain queued while Codex or the receiving agent is offline.
 
-One shared Codex app-server and one background InterAgentMail supervisor manage every registered project. Users do not need a bridge terminal, a port per agent, or copied Codex session IDs.
+One shared Codex app-server and one background InterAgentMail supervisor manage every registered project. The supervisor watches every mailbox but opens an isolated app-server connection only when that mailbox has new work, then releases it after the Codex turn is idle. Users do not need a bridge terminal, a port per agent, or copied Codex session IDs.
 
 ## Requirements
 
@@ -83,7 +83,7 @@ iam capabilities --json
 - `iam doctor` runs read-only health checks for IAM, Codex, services, project registration, MCP configuration, mailboxes, safety policy, and resumable threads.
 - `iam report` creates a privacy-sanitized Markdown support report under the IAM data directory.
 - `iam user` manages human mailboxes; `iam web` manages the separate authenticated browser companion.
-- `iam open` resumes the exact thread owned by the current or named project.
+- `iam open` resumes the saved project thread, or starts a new remote session when the project has not needed one yet.
 - `iam stop` stops mail delivery but leaves the shared app-server running.
 - `iam stop --all` stops both IAM-managed background services.
 - `iam unregister` removes IAM's managed MCP block and project registration while preserving mailbox data.
@@ -96,6 +96,7 @@ iam capabilities --json
 2. Records its project directory and safety policy.
 3. Adds a clearly marked `mcp_servers.interagentmail` block to `.codex/config.toml`.
 4. Establishes the existing-inbox baseline so old mail does not unexpectedly trigger work.
+5. Lets the supervisor attach the project only when undelivered mail arrives; an active or approval-paused turn retains its own connection, and idle connections are released.
 
 Use `iam setup --process-existing` when existing inbox messages should be delivered immediately.
 

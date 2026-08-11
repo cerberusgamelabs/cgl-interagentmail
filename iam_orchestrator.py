@@ -21,6 +21,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -560,52 +561,133 @@ def registry_signature(projects: dict[str, dict[str, Any]]) -> tuple[tuple[str, 
     ))
 
 
-async def serve_once(url: str) -> None:
+@dataclass
+class SupervisorMailbox:
+    address: str
+    service: IAMService
+    state: DeliveryState
+    sandbox: str
+    approval_policy: str
+
+    def pending_messages(self) -> list[dict[str, Any]]:
+        messages = self.service.inbox(limit=1000)
+        pending = [message for message in messages if not self.state.is_delivered(str(message["id"]))]
+        return sorted(pending, key=lambda item: (str(item.get("created_at", "")), str(item["id"])))
+
+
+@dataclass
+class ActiveDelivery:
+    client: AppServerClient
+    bridge: MailboxBridge
+
+
+def supervisor_mailboxes(projects: dict[str, dict[str, Any]]) -> list[SupervisorMailbox]:
+    watched: list[SupervisorMailbox] = []
+    for address, entry in projects.items():
+        root = Path(entry["project_root"]).resolve()
+        if not root.is_dir():
+            LOG.warning("Skipping %s; project directory is missing: %s", address, root)
+            continue
+        service = IAMService(root)
+        state = DeliveryState.load(iam.mailbox(address) / ".codex-bridge-state.json")
+        state.initialize(service.inbox(limit=1000), process_existing=False)
+        watched.append(SupervisorMailbox(
+            address=address,
+            service=service,
+            state=state,
+            sandbox=str(entry.get("sandbox", "workspace-write")),
+            approval_policy=str(entry.get("approval_policy", "on-request")),
+        ))
+    return watched
+
+
+async def activate_delivery(mailbox: SupervisorMailbox, url: str) -> ActiveDelivery:
+    """Attach one mailbox to its own client connection only when mail requires it."""
+    client = AppServerClient(url=url)
+    try:
+        await client.connect()
+        bridge = MailboxBridge(
+            mailbox.service,
+            mailbox.state,
+            client,
+            explicit_thread_id=mailbox.state.thread_id,
+            create_thread=True,
+            sandbox=mailbox.sandbox,
+            approval_policy=mailbox.approval_policy,
+        )
+        thread = await bridge.attach_thread()
+        await bridge.ensure_resumable(thread)
+        LOG.info("Activated delivery for %s on isolated Codex connection and thread %s", mailbox.address, thread["id"])
+        return ActiveDelivery(client=client, bridge=bridge)
+    except BaseException:
+        await client.close()
+        raise
+
+
+async def release_if_idle(active: ActiveDelivery) -> bool:
+    """Release an idle mailbox's connection; active or approval-paused turns retain it."""
+    thread_id = active.bridge.state.thread_id
+    if not thread_id:
+        return True
+    result = await active.client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+    status = result["thread"].get("status") or {"type": "notLoaded"}
+    return status.get("type") in {"idle", "notLoaded"}
+
+
+async def close_active_delivery(address: str, active: ActiveDelivery) -> None:
+    try:
+        await active.client.close()
+    except (AppServerError, OSError, ValueError) as exc:
+        LOG.warning("Could not cleanly close delivery connection for %s: %s", address, exc)
+    else:
+        LOG.info("Released idle Codex delivery connection for %s", address)
+
+
+async def serve_once(url: str, *, poll_seconds: float = 2.0, run_once: bool = False) -> None:
     projects = registered_projects()
     if not projects:
         raise AppServerError("No projects are registered; run `iam setup <project>` first")
     signature = registry_signature(projects)
-    client = AppServerClient(url=url)
-    await client.connect()
-    bridges: list[MailboxBridge] = []
+    mailboxes = supervisor_mailboxes(projects)
+    active: dict[str, ActiveDelivery] = {}
     try:
-        for address, entry in projects.items():
-            root = Path(entry["project_root"]).resolve()
-            if not root.is_dir():
-                LOG.warning("Skipping %s; project directory is missing: %s", address, root)
-                continue
-            service = IAMService(root)
-            state = DeliveryState.load(iam.mailbox(address) / ".codex-bridge-state.json")
-            state.initialize(service.inbox(limit=1000), process_existing=False)
-            bridge = MailboxBridge(
-                service,
-                state,
-                client,
-                explicit_thread_id=state.thread_id,
-                create_thread=True,
-                sandbox=str(entry.get("sandbox", "workspace-write")),
-                approval_policy=str(entry.get("approval_policy", "on-request")),
-            )
-            thread = await bridge.attach_thread()
-            await bridge.ensure_resumable(thread)
-            LOG.info("Watching %s at %s on thread %s", address, root, thread["id"])
-            bridges.append(bridge)
+        while True:
+            for mailbox in mailboxes:
+                session = active.get(mailbox.address)
+                pending = mailbox.pending_messages()
+                if session is None:
+                    if not pending:
+                        continue
+                    try:
+                        session = await activate_delivery(mailbox, url)
+                        active[mailbox.address] = session
+                    except (AppServerError, OSError, KeyError, ValueError) as exc:
+                        LOG.error("Could not activate delivery for %s: %s", mailbox.address, exc)
+                        continue
 
-        while not client.closed.is_set():
-            for bridge in bridges:
                 try:
-                    await bridge.deliver_once()
-                except (AppServerError, KeyError, ValueError) as exc:
-                    LOG.error("Delivery failed for %s: %s", bridge.service.address, exc)
+                    delivered = await session.bridge.deliver_once()
+                    if delivered:
+                        # A turn can still report idle immediately after turn/start; retain its
+                        # isolated connection until at least the following supervisor pass.
+                        continue
+                    if not mailbox.pending_messages() and await release_if_idle(session):
+                        await close_active_delivery(mailbox.address, session)
+                        active.pop(mailbox.address, None)
+                except (AppServerError, OSError, KeyError, ValueError) as exc:
+                    LOG.error("Delivery failed for %s: %s", mailbox.address, exc)
+                    await close_active_delivery(mailbox.address, session)
+                    active.pop(mailbox.address, None)
+
             if registry_signature(registered_projects()) != signature:
                 LOG.info("Project registry changed; reloading")
                 return
-            try:
-                await asyncio.wait_for(client.closed.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+            if run_once:
+                return
+            await asyncio.sleep(poll_seconds)
     finally:
-        await client.close()
+        for address, session in list(active.items()):
+            await close_active_delivery(address, session)
 
 
 async def daemon_loop(url: str) -> None:
@@ -691,6 +773,7 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "user_mailboxes": True,
             "authenticated_web_interface": True,
             "lan_access_opt_in": True,
+            "lazy_isolated_delivery_connections": True,
             "web_managed_by_iam_service": False,
         },
     }
@@ -1541,17 +1624,18 @@ def cmd_open(args: argparse.Namespace) -> None:
         address, root, entry = project_entry(root_value)
     ensure_appserver(args.url)
     ensure_daemon(args.url)
-    thread_id = wait_for_thread(address, args.url, root)
+    state = DeliveryState.load(iam.mailbox(address) / ".codex-bridge-state.json")
     command = [
         codex_executable(),
-        "resume",
         "--remote", args.url,
         "-C", str(root),
         "-s", str(entry.get("sandbox", "workspace-write")),
         "-a", str(entry.get("approval_policy", "on-request")),
-        "--include-non-interactive",
-        thread_id,
     ]
+    if state.thread_id:
+        thread_id = wait_for_thread(address, args.url, root)
+        command[1:1] = ["resume"]
+        command.extend(["--include-non-interactive", thread_id])
     raise SystemExit(subprocess.run(command, check=False).returncode)
 
 
