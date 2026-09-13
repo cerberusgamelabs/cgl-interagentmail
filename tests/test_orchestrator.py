@@ -211,13 +211,13 @@ class WindowsProcessTests(unittest.TestCase):
 
     def test_windows_exited_process_is_not_alive(self) -> None:
         kernel32 = self._Kernel32(exit_code=0)
-        with patch("iam_orchestrator.os.name", "nt"), patch("iam_orchestrator.ctypes.windll", type("Windll", (), {"kernel32": kernel32})()):
+        with patch("iam_orchestrator.os.name", "nt"), patch("iam_orchestrator.ctypes.windll", type("Windll", (), {"kernel32": kernel32})(), create=True):
             self.assertFalse(pid_alive(33040))
         self.assertTrue(kernel32.closed)
 
     def test_windows_still_active_process_is_alive(self) -> None:
         kernel32 = self._Kernel32(exit_code=259)
-        with patch("iam_orchestrator.os.name", "nt"), patch("iam_orchestrator.ctypes.windll", type("Windll", (), {"kernel32": kernel32})()):
+        with patch("iam_orchestrator.os.name", "nt"), patch("iam_orchestrator.ctypes.windll", type("Windll", (), {"kernel32": kernel32})(), create=True):
             self.assertTrue(pid_alive(33040))
         self.assertTrue(kernel32.closed)
 
