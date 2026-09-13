@@ -39,7 +39,9 @@ class WebConnectTests(unittest.TestCase):
         with patch("iam_webconnect.urlopen", return_value=response):
             path = Path(client.download_attachment(manifest, "message-123"))
             self.assertEqual(data, path.read_bytes())
-            self.assertEqual(self.root / "attachments" / "webconnect" / "message-123" / "note.txt", path)
+            # Windows temporary roots may use an 8.3 alias (e.g. RUNNER~1).
+            expected = self.root / "attachments" / "webconnect" / "message-123" / "note.txt"
+            self.assertEqual(expected.resolve(), path)
             with self.assertRaises(WebConnectError):
                 client.download_attachment(dict(manifest, sha256="0" * 64), "message-bad")
             self.assertFalse((self.root / "attachments" / "webconnect" / "message-bad").exists())
