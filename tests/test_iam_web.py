@@ -33,10 +33,11 @@ class WebFixture(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.old_paths = (iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.CONFIG)
+        self.old_paths = (iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.TEAMS, iam.CONFIG)
         iam.ROOT = self.root / "iam-home"
         iam.MAILBOXES = iam.ROOT / "mailboxes"
         iam.CHATS = iam.ROOT / "chats"
+        iam.TEAMS = iam.ROOT / "teams"
         iam.CONFIG = iam.ROOT / "config.json"
         self.agent_root = self.root / "SecurityReviewer"
         self.agent_root.mkdir()
@@ -55,7 +56,7 @@ class WebFixture(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=3)
-        iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.CONFIG = self.old_paths
+        iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.TEAMS, iam.CONFIG = self.old_paths
         self.temp.cleanup()
 
     def request(
@@ -98,14 +99,15 @@ class UserMailboxTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.old_paths = (iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.CONFIG)
+        self.old_paths = (iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.TEAMS, iam.CONFIG)
         iam.ROOT = self.root / "iam-home"
         iam.MAILBOXES = iam.ROOT / "mailboxes"
         iam.CHATS = iam.ROOT / "chats"
+        iam.TEAMS = iam.ROOT / "teams"
         iam.CONFIG = iam.ROOT / "config.json"
 
     def tearDown(self) -> None:
-        iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.CONFIG = self.old_paths
+        iam.ROOT, iam.MAILBOXES, iam.CHATS, iam.TEAMS, iam.CONFIG = self.old_paths
         self.temp.cleanup()
 
     def test_user_mailbox_is_idempotent_and_has_no_project_identity(self) -> None:
@@ -300,6 +302,7 @@ class WebMessagingTests(WebFixture):
         sent = sent_payload["data"]["message"]
         self.assertEqual("Human", sent["from"])
         self.assertEqual(sent["id"], self.agent.inbox()[0]["id"])
+        self.assertEqual("normal", sent["priority"])
 
         reply = self.agent.reply(sent["id"], "No findings.")
         status, inbox_payload, _headers = self.request("GET", "/api/messages?folder=inbox")
@@ -324,6 +327,48 @@ class WebMessagingTests(WebFixture):
         self.assertEqual(200, status)
         self.assertEqual([], IAMService.for_mailbox("Human").inbox())
         self.assertEqual(reply["id"], IAMService.for_mailbox("Human").list_messages("archive")[0]["id"])
+
+    def test_web_accepts_urgent_priority_and_rejects_unknown_priority(self) -> None:
+        self.login()
+        status, payload, _headers = self.request(
+            "POST", "/api/send",
+            {"to": ["SecurityReviewer"], "subject": "Urgent", "body": "Please stop safely.", "priority": "urgent"},
+            csrf=True,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("urgent", payload["data"]["message"]["priority"])
+        status, payload, _headers = self.request(
+            "POST", "/api/send",
+            {"to": ["SecurityReviewer"], "subject": "Bad", "body": "No", "priority": "immediate"},
+            csrf=True,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("IAM_WEB_REQUEST_INVALID", payload["error"]["code"])
+
+    def test_authenticated_user_can_manage_own_timers(self) -> None:
+        self.login()
+        status, payload, _headers = self.request(
+            "POST", "/api/timer/set",
+            {"note": "Check audit.", "due_at": "2030-01-01T00:00:00+00:00"}, csrf=True,
+        )
+        self.assertEqual(201, status)
+        timer_id = payload["data"]["timer"]["id"]
+        status, payload, _headers = self.request("GET", "/api/timers")
+        self.assertEqual(200, status)
+        self.assertEqual([timer_id], [timer["id"] for timer in payload["data"]["timers"]])
+        status, _payload, _headers = self.request("POST", "/api/timer/clear", {"timer_id": timer_id}, csrf=True)
+        self.assertEqual(200, status)
+
+    def test_authenticated_user_can_create_local_team(self) -> None:
+        self.login()
+        status, payload, _headers = self.request(
+            "POST", "/api/team/create", {"name": "reviewers", "members": ["SecurityReviewer"]}, csrf=True,
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("reviewers", payload["data"]["team"]["name"])
+        status, payload, _headers = self.request("GET", "/api/teams")
+        self.assertEqual(200, status)
+        self.assertEqual(["reviewers"], [team["name"] for team in payload["data"]["teams"]])
 
     def test_lan_mode_discloses_network_warning_after_login(self) -> None:
         app = WebApplication({**self.full_config, "lan_enabled": True}, host="0.0.0.0")

@@ -4,9 +4,19 @@
 
 InterAgentMail gives local OpenAI Codex project agents durable mailboxes and automatic wake-up delivery. Agents can send work to one another, keep messages queued while offline, and resume the correct project thread without copied session IDs or a bridge terminal per agent.
 
-Version 1.3 adds an authenticated browser inbox for people. A human mailbox uses the same IAM message flow as every agent: send a request from the browser, let the receiving project agent wake and work, and read its reply in the browser. The interface defaults to this-PC-only and can be explicitly enabled for laptops and other devices on the same trusted network. Version 1.3.1 also makes wake-up delivery lazy and isolated: only mailboxes with new work receive an app-server connection, so inactive projects consume no loaded-thread slots and one broken project cannot halt the rest.
+Version 1.3 adds an authenticated browser inbox for people. A human mailbox uses the same IAM message flow as every agent: send a request from the browser, let the receiving project agent wake and work, and read its reply in the browser. The interface defaults to this-PC-only and can be explicitly enabled for laptops and other devices on the same trusted network. Version 1.4.0 also makes wake-up delivery lazy and isolated: only mailboxes with new work receive an app-server connection, so inactive projects consume no loaded-thread slots and one broken project cannot halt the rest.
 
 Created by Cerberus Game Labs and released as open-source software under the MIT License.
+
+## New in 1.4.0
+
+- Optional outbound WebConnect client for compatible hosted or self-hosted relays, including separately scoped headless mailboxes, attachment integrity checks, and incremental connector updates.
+- Urgent mail can notify an active agent through turn steering; ordinary mail stays queued until idle.
+- Single-channel chat subscriptions and automatic delivery of chat updates and membership events.
+- Persistent one-shot reminders with snooze/clear controls, teams, explicit leader capabilities, and team/leader addressing.
+- Pinned threads remain preserved on resume failures rather than being silently replaced.
+
+The WebConnect server is a separate application. This package does not include its hosted account, billing, or OAuth UI. Sharing one session across multiple project mailboxes is not a supported feature of this release.
 
 ## Requirements
 
@@ -31,7 +41,7 @@ iam web setup MyMailbox --display-name "My Name"
 iam web start
 ```
 
-Then open `http://127.0.0.1:8787`. Browser lifecycle is standalone in v1.3.1 and does not restart IAM delivery or Codex. Agent requests remain queued whenever delivery is stopped.
+Then open `http://127.0.0.1:8787`. Browser lifecycle is standalone in v1.4.0 and does not restart IAM delivery or Codex. Agent requests remain queued whenever delivery is stopped.
 
 LAN access is explicit:
 
@@ -53,8 +63,8 @@ Default agents are workspace-sandboxed and unattended approval requests are reje
 - Source code: `https://github.com/cerberusgamelabs/cgl-interagentmail`
 - Installation guide: `https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/docs/INSTALL.md`
 - Issues and support: `https://github.com/cerberusgamelabs/cgl-interagentmail/issues`
-- Current release: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/tag/v1.3.1`
+- Current release: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/tag/v1.4.0`
 - Python package: `https://pypi.org/project/cgl-interagentmail/`
-- Current wheel: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.3.1/cgl_interagentmail-1.3.1-py3-none-any.whl`
-- SHA-256 checksums: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.3.1/SHA256SUMS.txt`
+- Current wheel: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.4.0/cgl_interagentmail-1.4.0-py3-none-any.whl`
+- SHA-256 checksums: `https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.4.0/SHA256SUMS.txt`
 - License: `https://github.com/cerberusgamelabs/cgl-interagentmail/blob/main/LICENSE`

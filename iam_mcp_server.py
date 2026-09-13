@@ -66,9 +66,10 @@ def iam_send(
     cc: list[str] | None = None,
     attachments: list[str] | None = None,
     references: list[str] | None = None,
+    priority: str = "normal",
 ) -> dict[str, Any]:
-    """Send a new message. Addresses may also be unique display names."""
-    return service().send(to, subject, body, cc, attachments, references)
+    """Send a new message. Priority is normal or urgent; urgent may steer an active Codex turn."""
+    return service().send(to, subject, body, cc, attachments, references, priority=priority)
 
 
 @mcp.tool()
@@ -80,15 +81,70 @@ def iam_reply(
     subject: str | None = None,
     attachments: list[str] | None = None,
     references: list[str] | None = None,
+    priority: str = "normal",
 ) -> dict[str, Any]:
     """Send a substantive reply in an existing thread, preserving originator and routing."""
-    return service().reply(message_id, body, to, cc, subject, attachments, references)
+    return service().reply(message_id, body, to, cc, subject, attachments, references, priority=priority)
 
 
 @mcp.tool()
 def iam_archive(message_id: str) -> dict[str, str]:
     """Archive one fully handled inbox message."""
     return service().archive(message_id)
+
+
+@mcp.tool()
+def iam_timer_set(note: str, due_at: str) -> dict[str, Any]:
+    """Set a one-shot reminder for this mailbox at an ISO-8601 timezone-aware time."""
+    return service().timer_set(note, due_at)
+
+
+@mcp.tool()
+def iam_timer_set_team(team: str, note: str, due_at: str) -> list[dict[str, Any]]:
+    """Schedule independent timers for an authorized team. Only an explicitly granted active leader may use this."""
+    return service().timer_set_team(team, note, due_at)
+
+
+@mcp.tool()
+def iam_timer_set_for(target: str, note: str, due_at: str) -> dict[str, Any]:
+    """Schedule a timer for one authorized teammate; explicit timer.schedule permission is required."""
+    return service().timer_set_for(target, note, due_at)
+
+
+@mcp.tool()
+def iam_timer_list(due_only: bool = False) -> list[dict[str, Any]]:
+    """List this mailbox's outstanding temporary reminders."""
+    return service().timer_list(due_only)
+
+
+@mcp.tool()
+def iam_timer_clear(timer_id: str) -> dict[str, str]:
+    """Clear a handled timer permanently. Cleared timers are not archived."""
+    return service().timer_clear(timer_id)
+
+
+@mcp.tool()
+def iam_timer_cancel(timer_id: str) -> dict[str, str]:
+    """Cancel an outstanding timer created by or targeted to this mailbox."""
+    return service().timer_cancel(timer_id)
+
+
+@mcp.tool()
+def iam_timer_snooze(timer_id: str, due_at: str) -> dict[str, Any]:
+    """Move one outstanding timer to a new ISO-8601 timezone-aware due time."""
+    return service().timer_snooze(timer_id, due_at)
+
+
+@mcp.tool()
+def iam_team_add_member(team: str, member: str) -> dict[str, Any]:
+    """Add one mailbox to this leader's team when team.manage_members was explicitly granted."""
+    return service().team_add_member_as_leader(team, member)
+
+
+@mcp.tool()
+def iam_team_remove_member(team: str, member: str) -> dict[str, Any]:
+    """Remove a non-leader mailbox from this leader's team when team.manage_members was granted."""
+    return service().team_remove_member_as_leader(team, member)
 
 
 @mcp.tool()
@@ -104,15 +160,34 @@ def iam_chat_tail(channel: str, lines: int = 10, date: str | None = None) -> dic
 
 
 @mcp.tool()
-def iam_chat_post(
+def iam_chat_join(
     channel: str,
-    message: str,
     channel_type: str | None = None,
     with_agent: str | None = None,
+) -> dict[str, Any]:
+    """Join one live channel and make it active; joining another leaves the prior one. Use channel_type=private and with_agent only to create a new DM."""
+    return service().chat_join(channel, channel_type, with_agent)
+
+
+@mcp.tool()
+def iam_chat_leave() -> dict[str, Any]:
+    """Leave this mailbox's active live chat channel and stop its supervisor notifications."""
+    return service().chat_leave()
+
+
+@mcp.tool()
+def iam_chat_subscriptions() -> dict[str, Any] | None:
+    """Return this mailbox's active live chat subscription, if any."""
+    return service().chat_subscription()
+
+
+@mcp.tool()
+def iam_chat_post(
+    message: str,
     date: str | None = None,
 ) -> dict[str, Any]:
-    """Post to a chat; set channel_type=private and with_agent for a new DM."""
-    return service().chat_post(channel, message, channel_type, with_agent, date)
+    """Post to this mailbox's active chat channel. Join a channel first; its channel cannot be supplied here."""
+    return service().chat_post(message, date)
 
 
 @mcp.tool()

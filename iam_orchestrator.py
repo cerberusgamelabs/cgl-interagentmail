@@ -41,6 +41,7 @@ from iam_web import (
     update_password as update_web_password,
     web_config_path,
 )
+from iam_webconnect import ConnectorState, WebConnectClient, WebConnectError, load_config as load_webconnect_config, save_config as save_webconnect_config
 
 
 LOG = logging.getLogger("iam.orchestrator")
@@ -167,12 +168,39 @@ def toml_string(value: str) -> str:
 def mcp_block(project_root: Path) -> str:
     args = ["-m", "iam_mcp_server", "--project-root", str(project_root)]
     rendered_args = ", ".join(toml_string(item) for item in args)
+    tool_approvals = "\n".join(
+        f"\n[mcp_servers.interagentmail.tools.{tool}]\napproval_mode = \"approve\""
+        for tool in (
+            "iam_inbox",
+            "iam_read",
+            "iam_reply",
+            "iam_archive",
+            "iam_list_mailboxes",
+            "iam_send",
+            "iam_list_channels",
+            "iam_chat_join",
+            "iam_chat_leave",
+            "iam_chat_subscriptions",
+            "iam_chat_tail",
+            "iam_chat_post",
+            "iam_chat_seen",
+            "iam_timer_set",
+            "iam_timer_set_team",
+            "iam_timer_set_for",
+            "iam_timer_list",
+            "iam_timer_clear",
+            "iam_timer_cancel",
+            "iam_timer_snooze",
+            "iam_team_add_member",
+            "iam_team_remove_member",
+        )
+    )
     return (
         f"{MCP_BEGIN}\n"
         "[mcp_servers.interagentmail]\n"
         f"command = {toml_string(sys.executable)}\n"
         f"args = [{rendered_args}]\n"
-        "required = true\n"
+        f"required = true\n{tool_approvals}\n"
         f"{MCP_END}\n"
     )
 
@@ -244,6 +272,7 @@ def setup_project(
     sandbox: str = "workspace-write",
     approval_policy: str = "on-request",
     process_existing: bool = False,
+    claim_empty_mailbox: bool = False,
 ) -> dict[str, Any]:
     root = Path(project_root).expanduser().resolve()
     if not root.is_dir():
@@ -318,20 +347,38 @@ def setup_project(
         profile_before = loaded_profile
     profile_owner = str(profile_before.get("project_root", "")).strip()
     profile_kind = profile_before.get("kind")
-    if box_existed and not profile_owner:
-        raise IAMCommandError(
-            "IAM_ADDRESS_COLLISION",
-            f"Mailbox address {address} already exists without project ownership; IAM will not migrate it implicitly.",
-            recoverable=True,
-            details={"address": address, "requested_project_root": str(root)},
-        )
-    if profile_owner and profile_kind == "user":
+    claimed_empty_mailbox = False
+    if profile_kind == "user":
         raise IAMCommandError(
             "IAM_ADDRESS_COLLISION",
             f"Mailbox address {address} is owned by a human user and cannot become a project identity.",
             recoverable=True,
             details={"address": address, "requested_project_root": str(root)},
         )
+    if box_existed and not profile_owner:
+        # `InterAgentMail init` creates this exact, otherwise empty shape.  It
+        # is safe to claim only when the caller makes that intent explicit;
+        # never silently convert a human or previously used mailbox.
+        allowed_entries = {"profile.json", "inbox", "sent", "archive"}
+        unexpected_entries = [entry.name for entry in box.iterdir() if entry.name not in allowed_entries]
+        folders_empty = all(
+            (box / folder).is_dir() and not any((box / folder).iterdir())
+            for folder in ("inbox", "sent", "archive")
+        )
+        default_profile = profile_before == {"address": address, "display_name": address}
+        can_claim = default_profile and not unexpected_entries and folders_empty
+        if not claim_empty_mailbox or not can_claim:
+            raise IAMCommandError(
+                "IAM_ADDRESS_COLLISION",
+                f"Mailbox address {address} already exists without project ownership; IAM will not migrate it implicitly.",
+                recoverable=True,
+                details={
+                    "address": address,
+                    "requested_project_root": str(root),
+                    "claim_empty_mailbox_available": can_claim,
+                },
+            )
+        claimed_empty_mailbox = True
     if profile_owner:
         try:
             mailbox_root = Path(profile_owner).expanduser().resolve()
@@ -398,7 +445,7 @@ def setup_project(
         "approval_policy": approval_policy,
         "thread_state": "pinned" if state.thread_id else "pending",
         "thread_preserved": bool(state.thread_id),
-        "legacy_mailbox_reused": False,
+        "legacy_mailbox_reused": claimed_empty_mailbox,
         "supervisor_reload": "automatic",
     }
 
@@ -459,11 +506,22 @@ def pid_alive(pid: int | None) -> bool:
         return False
     if os.name == "nt":
         process_query_limited_information = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
         if not handle:
             return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            # Windows can retain an openable process object after the process
+            # itself has exited.  Treat only STILL_ACTIVE as a live process;
+            # otherwise stale PID files prevent WebConnect and IAM services
+            # from recovering after a reboot or clean exit.
+            return exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except (OSError, SystemError, ValueError):
@@ -501,7 +559,11 @@ async def appserver_available(url: str, timeout: float = 2.0) -> bool:
     try:
         await client.connect()
         return True
-    except (AppServerError, OSError):
+    # A process can leave a listener behind while it is shutting down (or,
+    # rarely on Windows, after it was forcibly terminated).  Connecting to
+    # that listener times out during the WebSocket opening handshake.  Treat
+    # it as unavailable so `iam start` can recover or provide a useful error.
+    except (AppServerError, OSError, asyncio.TimeoutError):
         return False
     finally:
         await client.close()
@@ -527,7 +589,11 @@ def ensure_appserver(url: str, wait_seconds: float = 15.0) -> str:
             return f"started (pid {pid})"
         if not pid_alive(pid):
             break
-    raise SystemExit(f"Codex app-server did not start. See {log_path('app-server')}")
+    raise SystemExit(
+        f"Codex app-server did not start. See {log_path('app-server')}. "
+        "If the endpoint port is still occupied after Codex was force-closed, "
+        "restart Windows to clear the stale listener, then run `iam start` again."
+    )
 
 
 def ensure_daemon(url: str) -> str:
@@ -574,6 +640,13 @@ class SupervisorMailbox:
         pending = [message for message in messages if not self.state.is_delivered(str(message["id"]))]
         return sorted(pending, key=lambda item: (str(item.get("created_at", "")), str(item["id"])))
 
+    def pending_chat(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        return self.service.chat_updates()
+
+    def pending_timers(self) -> list[dict[str, Any]]:
+        return [timer for timer in self.service.timer_list(due_only=True)
+                if not timer.get("delivery", {}).get("delivered_at")]
+
 
 @dataclass
 class ActiveDelivery:
@@ -611,7 +684,10 @@ async def activate_delivery(mailbox: SupervisorMailbox, url: str) -> ActiveDeliv
             mailbox.state,
             client,
             explicit_thread_id=mailbox.state.thread_id,
-            create_thread=True,
+            # A recorded mailbox thread is authoritative.  Never replace it
+            # merely because a transient app-server failure makes it appear
+            # unavailable; that destroys the user's chosen conversation.
+            create_thread=not bool(mailbox.state.thread_id),
             sandbox=mailbox.sandbox,
             approval_policy=mailbox.approval_policy,
         )
@@ -655,8 +731,10 @@ async def serve_once(url: str, *, poll_seconds: float = 2.0, run_once: bool = Fa
             for mailbox in mailboxes:
                 session = active.get(mailbox.address)
                 pending = mailbox.pending_messages()
+                chat_state, pending_chat = mailbox.pending_chat()
+                pending_timers = mailbox.pending_timers()
                 if session is None:
-                    if not pending:
+                    if not pending and not pending_chat and not pending_timers:
                         continue
                     try:
                         session = await activate_delivery(mailbox, url)
@@ -666,12 +744,25 @@ async def serve_once(url: str, *, poll_seconds: float = 2.0, run_once: bool = Fa
                         continue
 
                 try:
+                    if pending_timers:
+                        timer = pending_timers[0]
+                        if await session.bridge.deliver_timer(timer):
+                            mailbox.service.timer_mark_delivered(str(timer["id"]))
+                            LOG.info("Delivered timer %s for %s", timer["id"], mailbox.address)
+                            continue
+                    if chat_state and pending_chat:
+                        delivered_chat = await session.bridge.deliver_chat(chat_state["channel"], pending_chat[:10])
+                        if delivered_chat:
+                            mailbox.service.chat_mark_delivered(chat_state, pending_chat[:10])
+                            LOG.info("Delivered %d chat update(s) for %s", min(10, len(pending_chat)), mailbox.address)
+                            continue
                     delivered = await session.bridge.deliver_once()
                     if delivered:
                         # A turn can still report idle immediately after turn/start; retain its
                         # isolated connection until at least the following supervisor pass.
                         continue
-                    if not mailbox.pending_messages() and await release_if_idle(session):
+                    _chat_state, remaining_chat = mailbox.pending_chat()
+                    if not mailbox.pending_messages() and not remaining_chat and not mailbox.pending_timers() and await release_if_idle(session):
                         await close_active_delivery(mailbox.address, session)
                         active.pop(mailbox.address, None)
                 except (AppServerError, OSError, KeyError, ValueError) as exc:
@@ -715,6 +806,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             sandbox=sandbox,
             approval_policy=args.approval_policy,
             process_existing=args.process_existing,
+            claim_empty_mailbox=args.claim_empty_mailbox,
         )
         for root in roots
     ]
@@ -774,6 +866,7 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "authenticated_web_interface": True,
             "lan_access_opt_in": True,
             "lazy_isolated_delivery_connections": True,
+            "urgent_mail_steering": True,
             "web_managed_by_iam_service": False,
         },
     }
@@ -1064,6 +1157,152 @@ def cmd_web_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_connect_configure(args: argparse.Namespace) -> int:
+    raw_mailboxes = args.human_mailbox if isinstance(args.human_mailbox, list) else [args.human_mailbox]
+    mailboxes = list(dict.fromkeys(value.strip() for value in raw_mailboxes if isinstance(value, str) and value.strip()))
+    data = {
+        "schema_version": 1,
+        "server_url": args.server_url.rstrip("/"),
+        "node_id": args.node_id,
+        "node_token": args.node_token,
+        "human_mailbox": mailboxes[0] if mailboxes else "",
+        "human_mailboxes": mailboxes,
+        "enabled": True,
+        "allow_insecure_development": bool(args.allow_insecure_development),
+    }
+    try:
+        save_webconnect_config(data)
+        state = ConnectorState.load()
+        state.outbound.clear()
+        WebConnectClient(data, state).baseline_existing_replies()
+    except WebConnectError as exc:
+        raise IAMCommandError("IAM_CONNECT_CONFIG_INVALID", str(exc), recoverable=True) from None
+    print(f"Configured WebConnect node {args.node_id} for {args.server_url} as {', '.join(mailboxes)}.")
+    return 0
+
+
+def _restart_webconnect_if_running() -> int | None:
+    """Reload only the outbound connector after a durable config mutation."""
+    pid = read_pid("connect")
+    if not pid_alive(pid):
+        return None
+    assert pid is not None
+    stop_process(pid, tree=True)
+    try:
+        pid_path("connect", create=False).unlink()
+    except FileNotFoundError:
+        pass
+    return spawn_background([sys.executable, "-m", "iam_webconnect"], "connect")
+
+
+def cmd_connect_update(args: argparse.Namespace) -> int:
+    try:
+        data = load_webconnect_config()
+    except WebConnectError as exc:
+        raise IAMCommandError("IAM_CONNECT_NOT_CONFIGURED", str(exc), recoverable=True) from None
+    if args.server_url is not None:
+        data["server_url"] = args.server_url.rstrip("/")
+    if args.node_id is not None:
+        data["node_id"] = args.node_id
+    if args.node_token is not None:
+        data["node_token"] = args.node_token
+    if args.allow_insecure_development is not None:
+        data["allow_insecure_development"] = args.allow_insecure_development
+    additions = args.human_mailbox or []
+    data["human_mailboxes"] = list(dict.fromkeys([
+        *data["human_mailboxes"], *(value.strip() for value in additions if value and value.strip()),
+    ]))
+    data["human_mailbox"] = data["human_mailbox"] if data["human_mailbox"] in data["human_mailboxes"] else data["human_mailboxes"][0]
+    try:
+        save_webconnect_config(data)
+        state = ConnectorState.load()
+        WebConnectClient(data, state).baseline_existing_replies()
+    except WebConnectError as exc:
+        raise IAMCommandError("IAM_CONNECT_CONFIG_INVALID", str(exc), recoverable=True) from None
+    reloaded = _restart_webconnect_if_running()
+    print(f"Updated WebConnect node {data['node_id']} as {', '.join(data['human_mailboxes'])}.")
+    print(f"WebConnect client reloaded (pid {reloaded})." if reloaded else "WebConnect client is stopped; run `iam connect start` when ready.")
+    return 0
+
+
+def cmd_connect_removeuser(args: argparse.Namespace) -> int:
+    try:
+        data = load_webconnect_config()
+    except WebConnectError as exc:
+        raise IAMCommandError("IAM_CONNECT_NOT_CONFIGURED", str(exc), recoverable=True) from None
+    mailbox = args.human_mailbox.strip()
+    if mailbox not in data["human_mailboxes"]:
+        raise IAMCommandError("IAM_CONNECT_MAILBOX_NOT_FOUND", f"{mailbox} is not configured on this WebConnect connector.", recoverable=True)
+    remaining = [value for value in data["human_mailboxes"] if value != mailbox]
+    if not remaining:
+        raise IAMCommandError("IAM_CONNECT_LAST_MAILBOX", "A WebConnect connector must retain at least one human mailbox.", recoverable=True)
+    data["human_mailboxes"] = remaining
+    if data["human_mailbox"] == mailbox:
+        data["human_mailbox"] = remaining[0]
+    try:
+        save_webconnect_config(data)
+    except WebConnectError as exc:
+        raise IAMCommandError("IAM_CONNECT_CONFIG_INVALID", str(exc), recoverable=True) from None
+    reloaded = _restart_webconnect_if_running()
+    print(f"Removed {mailbox} from the local WebConnect connector.")
+    print("Revoke that account in WebConnect Settings too; otherwise the relay will safely reject this connector's mailbox list.")
+    print(f"WebConnect client reloaded (pid {reloaded})." if reloaded else "WebConnect client is stopped; run `iam connect start` when ready.")
+    return 0
+
+
+def cmd_connect_start(args: argparse.Namespace) -> int:
+    try:
+        config = load_webconnect_config()
+    except WebConnectError as exc:
+        raise IAMCommandError("IAM_CONNECT_NOT_CONFIGURED", str(exc), recoverable=True) from None
+    if not config["enabled"]:
+        config["enabled"] = True
+        save_webconnect_config(config)
+    pid = read_pid("connect")
+    if pid_alive(pid):
+        print(f"WebConnect client is already running (pid {pid}).")
+        return 0
+    pid = spawn_background([sys.executable, "-m", "iam_webconnect"], "connect")
+    print(f"WebConnect client started (pid {pid}) for {config['server_url']}.")
+    return 0
+
+
+def cmd_connect_status(args: argparse.Namespace) -> int:
+    try:
+        config = load_webconnect_config()
+    except WebConnectError as exc:
+        print(f"WebConnect: not configured ({exc})")
+        return 0
+    pid = read_pid("connect")
+    status = "running" if pid_alive(pid) else ("stopped" if config["enabled"] else "disabled")
+    print(f"WebConnect: {status}")
+    print(f"Server:     {config['server_url']}")
+    print(f"Node:       {config['node_id']}")
+    print(f"Humans:     {', '.join(config['human_mailboxes'])}")
+    return 0
+
+
+def cmd_connect_stop(args: argparse.Namespace) -> int:
+    pid = read_pid("connect")
+    if pid_alive(pid):
+        assert pid is not None
+        stop_process(pid, tree=True)
+        print(f"Stopped WebConnect client process tree {pid}.")
+    else:
+        print("WebConnect client is not running.")
+    try:
+        config = load_webconnect_config()
+        config["enabled"] = False
+        save_webconnect_config(config)
+    except WebConnectError:
+        pass
+    try:
+        pid_path("connect", create=False).unlink()
+    except FileNotFoundError:
+        pass
+    return 0
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     if not registered_projects():
         raise SystemExit("No projects are registered. Run `iam setup` in a project first.")
@@ -1142,7 +1381,7 @@ def managed_mcp_status(project_root: Path) -> tuple[str, str]:
 def mailbox_counts(address: str) -> dict[str, int]:
     box = iam.mailbox(address)
     result: dict[str, int] = {}
-    for folder in ("inbox", "sent", "archive"):
+    for folder in ("inbox", "sent", "archive", "timers"):
         path = box / folder
         result[folder] = sum(1 for item in path.glob("*.json") if item.is_file()) if path.is_dir() else 0
     return result
@@ -1395,7 +1634,7 @@ def collect_diagnostics(
         row["thread_pinned"] = bool(state.thread_id)
         row["delivered_count"] = len(state.delivered)
         if not state.thread_id:
-            add(CHECK_WARN, f"Thread {address}", "not pinned yet; `iam start` will create one")
+            add(CHECK_WARN, f"Thread {address}", "not pinned yet; the first delivery will create one")
         elif server_reachable:
             try:
                 resumable = asyncio.run(thread_available(url, state.thread_id, root))
@@ -1429,6 +1668,10 @@ def collect_diagnostics(
             "web_configured": web_configured,
             "web_running": web_running,
             "web_lan_enabled": web_lan_enabled,
+        },
+        "coordination": {
+            "teams": len(IAMService.team_list()),
+            "outstanding_timers": sum(row["mailbox"].get("timers", 0) for row in project_rows),
         },
         "target_project": str(target_root) if target_root else None,
         "projects": project_rows,
@@ -1527,9 +1770,19 @@ def render_report(diagnostics: dict[str, Any]) -> str:
             f"- Managed MCP configured: {'yes' if project.get('mcp') else 'no'}",
             f"- Thread pinned: {'yes' if project.get('thread_pinned') else 'no'}",
             f"- Delivered-message IDs recorded: {project.get('delivered_count', 0)}",
-            f"- Mailbox counts: inbox {counts['inbox']}, sent {counts['sent']}, archive {counts['archive']}",
+            f"- Mailbox counts: inbox {counts['inbox']}, sent {counts['sent']}, archive {counts['archive']}, timers {counts.get('timers', 0)}",
             "",
         ))
+
+    coordination = diagnostics.get("coordination", {})
+    lines.extend((
+        "## Coordination health",
+        "",
+        f"- Teams: {coordination.get('teams', 0)}",
+        f"- Outstanding timers: {coordination.get('outstanding_timers', 0)}",
+        "- Team names, memberships, timer notes, and timer IDs are intentionally omitted.",
+        "",
+    ))
 
     lines.extend((
         "## Recent log summary",
@@ -1632,8 +1885,23 @@ def cmd_open(args: argparse.Namespace) -> None:
         "-s", str(entry.get("sandbox", "workspace-write")),
         "-a", str(entry.get("approval_policy", "on-request")),
     ]
-    if state.thread_id:
+    requested_thread_id = getattr(args, "thread_id", None)
+    if requested_thread_id:
+        if not asyncio.run(thread_available(args.url, requested_thread_id, root)):
+            raise SystemExit(
+                f"Codex thread {requested_thread_id} is not available for {root}. "
+                "The existing IAM thread binding was left unchanged."
+            )
+        if state.thread_id != requested_thread_id:
+            state.thread_id = requested_thread_id
+            state.save()
+            print(f"Pinned {address} to explicitly selected Codex thread {requested_thread_id}.")
+        thread_id = requested_thread_id
+    elif state.thread_id:
         thread_id = wait_for_thread(address, args.url, root)
+        command[1:1] = ["resume"]
+        command.extend(["--include-non-interactive", thread_id])
+    if requested_thread_id:
         command[1:1] = ["resume"]
         command.extend(["--include-non-interactive", thread_id])
     raise SystemExit(subprocess.run(command, check=False).returncode)
@@ -1741,6 +2009,14 @@ def cmd_stop(args: argparse.Namespace) -> None:
             print(f"Stopped managed Codex app-server process tree {server_pid}.")
         else:
             print("Managed Codex app-server is not running.")
+            try:
+                if asyncio.run(appserver_available(getattr(args, "url", DEFAULT_URL))):
+                    print(
+                        "An unmanaged Codex app-server is still reachable and was left running. "
+                        "Stop it from the terminal that started it, or close that Codex process."
+                    )
+            except (OSError, RuntimeError, ValueError):
+                pass
     else:
         print("The shared Codex app-server was left running. Use `iam stop --all` to stop it too.")
 
@@ -1817,12 +2093,48 @@ def parser() -> argparse.ArgumentParser:
     web_password.add_argument("--json", action="store_true", dest="json_output")
     web_password.set_defaults(func=cmd_web_password)
 
+    connect = sub.add_parser("connect", help="Manage the outbound WebConnect transport client.")
+    connect_sub = connect.add_subparsers(dest="connect_command", required=True)
+    connect_configure = connect_sub.add_parser("configure", help="Configure a compatible WebConnect server and bound human mailbox.")
+    connect_configure.add_argument("--server-url", required=True)
+    connect_configure.add_argument("--node-id", required=True)
+    connect_configure.add_argument("--node-token", required=True)
+    connect_configure.add_argument(
+        "--human-mailbox",
+        action="append",
+        required=True,
+        help="Local IAM user mailbox. Repeat to authorize separate human identities such as Echo.",
+    )
+    connect_configure.add_argument("--allow-insecure-development", action="store_true")
+    connect_configure.set_defaults(func=cmd_connect_configure)
+    connect_update = connect_sub.add_parser("update", help="Persistently update selected WebConnect settings or add human mailboxes.")
+    connect_update.add_argument("--server-url")
+    connect_update.add_argument("--node-id")
+    connect_update.add_argument("--node-token")
+    connect_update.add_argument("--human-mailbox", action="append", help="Add one local IAM user mailbox without removing existing ones. Repeat as needed.")
+    connect_update.add_argument("--allow-insecure-development", action=argparse.BooleanOptionalAction, default=None)
+    connect_update.set_defaults(func=cmd_connect_update)
+    connect_removeuser = connect_sub.add_parser("removeuser", help="Remove one human mailbox from the local WebConnect connector.")
+    connect_removeuser.add_argument("--human-mailbox", required=True)
+    connect_removeuser.set_defaults(func=cmd_connect_removeuser)
+    connect_start = connect_sub.add_parser("start", help="Start the configured outbound WebConnect client.")
+    connect_start.set_defaults(func=cmd_connect_start)
+    connect_status = connect_sub.add_parser("status", help="Show configured WebConnect client status.")
+    connect_status.set_defaults(func=cmd_connect_status)
+    connect_stop = connect_sub.add_parser("stop", help="Stop only the WebConnect client.")
+    connect_stop.set_defaults(func=cmd_connect_stop)
+
     def add_registration_arguments(command: argparse.ArgumentParser) -> None:
         command.add_argument("projects", nargs="*", help="Project folders. Defaults to the current folder.")
         command.add_argument("--display-name", help="Optional human-facing mailbox label; defaults to the address.")
         command.add_argument("--full-access", action="store_true", help="Use Codex danger-full-access for this project.")
         command.add_argument("--approval-policy", choices=("untrusted", "on-request", "never"), default="on-request")
         command.add_argument("--process-existing", action="store_true", help="Process inbox mail already present on first setup.")
+        command.add_argument(
+            "--claim-empty-mailbox",
+            action="store_true",
+            help="Claim only an untouched mailbox created by `InterAgentMail init`; never migrates mail or human identities.",
+        )
         command.add_argument("--json", action="store_true", dest="json_output")
         command.set_defaults(func=cmd_setup)
 
@@ -1855,6 +2167,10 @@ def parser() -> argparse.ArgumentParser:
     open_command = sub.add_parser("open", help="Open the registered project's pinned Codex session.")
     open_command.add_argument("project", nargs="?", help="Project folder. Defaults to the current folder.")
     open_command.add_argument("--url", default=DEFAULT_URL)
+    open_command.add_argument(
+        "--thread-id",
+        help="Explicitly validate, pin, and open this Codex thread instead of the current IAM binding.",
+    )
     open_command.set_defaults(func=cmd_open)
 
     doctor = sub.add_parser("doctor", help="Run read-only health checks for IAM, Codex, and registered projects.")

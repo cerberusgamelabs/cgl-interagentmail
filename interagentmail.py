@@ -12,7 +12,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -34,10 +34,12 @@ def default_data_root() -> Path:
 ROOT = default_data_root()
 MAILBOXES = ROOT / "mailboxes"
 CHATS = ROOT / "chats"
+TEAMS = ROOT / "teams"
 CONFIG = ROOT / "config.json"
 
 
 SAFE_MESSAGE_PREFIX = re.compile(r"^[A-Za-z0-9-]+$")
+MESSAGE_PRIORITIES = {"normal", "urgent"}
 
 
 def safe_segment(value: str, label: str) -> str:
@@ -159,6 +161,13 @@ def project_dir(name: str, sender_root: str | None) -> Path:
     return path
 
 
+def normalize_priority(priority: str | None) -> str:
+    value = "normal" if priority is None else str(priority).strip().lower()
+    if value not in MESSAGE_PRIORITIES:
+        raise SystemExit("priority must be normal or urgent")
+    return value
+
+
 def send_message(
     sender: str,
     to: list[str],
@@ -170,9 +179,12 @@ def send_message(
     reply_to: str | None = None,
     originator: str | None = None,
     refs: list[str] | None = None,
+    priority: str | None = "normal",
+    metadata: dict | None = None,
 ) -> dict:
     if not to:
         raise SystemExit("At least one --to recipient is required.")
+    priority = normalize_priority(priority)
     for name in [sender, *to, *cc]:
         ensure_box(name)
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -190,12 +202,17 @@ def send_message(
         "cc_display": [display_name(name) for name in cc],
         "subject": subject,
         "body": body,
+        "priority": priority,
         "attachments": attach or [],
         "references": names(refs),
         "signature": display_name(sender),
         "created_at": now,
         "read_at": None,
     }
+    if metadata:
+        if not isinstance(metadata, dict):
+            raise SystemExit("message metadata must be an object")
+        payload["metadata"] = metadata
     for recipient in names([*to, *cc]):
         write_atomic(message_path(mailbox(recipient) / "inbox", msg_id), payload)
     write_atomic(message_path(mailbox(sender) / "sent", msg_id), payload)
@@ -227,23 +244,26 @@ def cmd_root(args: argparse.Namespace) -> None:
         path = Path(args.path).expanduser().resolve()
         if not path.exists():
             raise SystemExit(f"Project root does not exist: {path}")
-        write_atomic(CONFIG, {"project_root": str(path)})
+        # `config.json` also owns IAM's registered-project registry.  Root is
+        # legacy request-command metadata, so changing it must never erase
+        # active project registrations or their delivery configuration.
+        try:
+            data = load(CONFIG) if CONFIG.exists() else {}
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data["project_root"] = str(path)
+        write_atomic(CONFIG, data)
     root = configured_root()
     print(root if root else "No project root configured.")
 
 
 def cmd_send(args: argparse.Namespace) -> None:
-    sender = address(args.project_root)
-    payload = send_message(
-        sender,
-        resolve_names(args.to),
-        resolve_names(args.cc),
-        args.subject,
-        args.body,
-        attachments(args.attach),
-        args.thread,
-        originator=args.originator,
-        refs=args.ref,
+    from iam_service import IAMService
+    payload = IAMService(args.project_root).send(
+        args.to, args.subject, args.body, args.cc, args.attach, args.ref,
+        args.thread, args.originator, getattr(args, "priority", "normal"),
     )
     print(payload["id"])
 
@@ -269,6 +289,7 @@ def cmd_request(args: argparse.Namespace) -> None:
         args.thread,
         originator=args.originator,
         refs=args.ref,
+        priority=getattr(args, "priority", "normal"),
     )
     recipient = recipients[0]
     recipient_root = project_dir(recipient, args.project_root)
@@ -312,7 +333,8 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         status = "read" if msg.get("read_at") else "new"
         thread = msg.get("thread", "no-thread")
         sender = msg.get("from_display") or msg["from"]
-        rows.append(f"{msg['id']} [{status}] {thread} from {sender} <{msg['from']}>: {msg['subject']}")
+        priority = msg.get("priority", "normal")
+        rows.append(f"{msg['id']} [{status}] [{priority}] {thread} from {sender} <{msg['from']}>: {msg['subject']}")
     print("\n".join(rows) if rows else "No mail.")
 
 
@@ -395,38 +417,30 @@ def check_chat_access(data: dict, project_root: str | None) -> str | None:
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
+    from iam_service import IAMService
+    mailbox_address = getattr(args, "mailbox", None)
+    service = IAMService.for_mailbox(mailbox_address) if mailbox_address else IAMService(args.project_root)
     if args.chat_command == "post":
-        name = address(args.project_root)
-        data = load_chat(args.channel, args.date)
-        check_chat_access(data, args.project_root)
-        if args.channel_type:
-            data["channelType"] = args.channel_type
-        if data["channelType"] == "private":
-            if not data.get("participants") and not args.with_agent:
-                raise SystemExit("New private channels require --with <agent>.")
-            participants = data.get("participants") or [name, resolve_name(args.with_agent)]
-            if name not in participants:
-                raise SystemExit(f"{name} is not a participant in private channel {args.channel}.")
-            if args.with_agent:
-                other = resolve_name(args.with_agent)
-                if other not in participants:
-                    raise SystemExit(f"{other} is not a participant in private channel {args.channel}.")
-            data["participants"] = participants
-        stamp = now()
-        data["messages"].insert(0, {
-            "agent": display_name(name),
-            "address": name,
-            "timestamp": stamp,
-            "message": args.message,
-            "seen_by": {name: stamp},
-        })
-        save_chat(data)
-        print(f"{display_name(name)}({stamp}): {args.message}")
+        entry = service.chat_post(args.message, args.date)
+        print(f"{entry['agent']}({entry['timestamp']}): {entry['message']}")
+        return
+
+    if args.chat_command in {"join", "leave", "subscriptions"}:
+        if args.chat_command == "join":
+            result = service.chat_join(args.channel, args.channel_type, args.with_agent)
+            detail = f"; left {result['previous_channel']}" if result.get("previous_channel") else ""
+            print(f"Subscribed {display_name(service.address)} to {result['channel']}{detail}.")
+            return
+        if args.chat_command == "leave":
+            result = service.chat_leave()
+            print(f"Unsubscribed {display_name(service.address)} from {result['channel']}.")
+            return
+        state = service.chat_subscription()
+        print(state["channel"] if state else "No active chat subscription.")
         return
 
     if args.chat_command == "tail":
-        data = load_chat(args.channel, args.date)
-        check_chat_access(data, args.project_root)
+        data = service.chat_tail(args.channel, args.lines, args.date)
         rows = []
         for msg in data["messages"][:args.lines]:
             seen = ", ".join(display_name(name) for name in msg.get("seen_by", {}))
@@ -435,36 +449,99 @@ def cmd_chat(args: argparse.Namespace) -> None:
         return
 
     if args.chat_command == "seen":
-        name = address(args.project_root)
-        data = load_chat(args.channel, args.date)
-        check_chat_access(data, args.project_root)
-        stamp = now()
-        for msg in data["messages"][:args.lines]:
-            msg.setdefault("seen_by", {})[name] = stamp
-        save_chat(data)
-        print(f"{display_name(name)} marked {min(args.lines, len(data['messages']))} seen.")
+        result = service.chat_seen(args.channel, args.lines, args.date)
+        print(f"{display_name(service.address)} marked {result['marked_seen']} seen.")
         return
 
     raise SystemExit(f"Unknown chat command: {args.chat_command}")
 
 
+def _timer_due_at(args: argparse.Namespace) -> str:
+    if bool(getattr(args, "in_duration", None)) == bool(getattr(args, "at", None)):
+        raise SystemExit("Specify exactly one of --in or --at.")
+    if getattr(args, "at", None):
+        value = args.at.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise SystemExit("--at must be ISO-8601 with a timezone, for example 2026-08-31T18:30:00-04:00") from exc
+        if parsed.tzinfo is None:
+            raise SystemExit("--at must include a timezone.")
+        return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+    match = re.fullmatch(r"(\d+)([smhd])", args.in_duration.strip(), re.IGNORECASE)
+    if not match:
+        raise SystemExit("--in must be a positive duration such as 15m, 2h, or 1d.")
+    amount, unit = int(match.group(1)), match.group(2).lower()
+    if amount < 1:
+        raise SystemExit("--in must be positive.")
+    seconds = amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).replace(microsecond=0).isoformat()
+
+
+def cmd_timer(args: argparse.Namespace) -> None:
+    from iam_service import IAMService
+    service = IAMService.for_mailbox(args.mailbox) if getattr(args, "mailbox", None) else IAMService(args.project_root)
+    if args.timer_command == "set":
+        due_at = _timer_due_at(args)
+        if args.team and args.to:
+            raise SystemExit("Use either --team or --to, not both.")
+        if args.team:
+            timers = service.timer_set_team(args.team, args.note, due_at)
+            print("\n".join(f"{timer['target']}: {timer['id']} due {timer['due_at']}" for timer in timers))
+        elif args.to:
+            timer = service.timer_set_for(args.to, args.note, due_at)
+            print(f"{timer['target']}: {timer['id']} due {timer['due_at']}")
+        else:
+            timer = service.timer_set(args.note, due_at)
+            print(f"{timer['id']} due {timer['due_at']}")
+    elif args.timer_command == "list":
+        rows = service.timer_list(args.due_only)
+        print("\n".join(f"{row['id']} | {row['due_at']} | {row['note']}" for row in rows) or "No outstanding timers.")
+    elif args.timer_command == "clear":
+        service.timer_clear(args.id)
+        print(f"Cleared {args.id}.")
+    elif args.timer_command == "cancel":
+        service.timer_cancel(args.id)
+        print(f"Cancelled {args.id}.")
+    elif args.timer_command == "snooze":
+        timer = service.timer_snooze(args.id, _timer_due_at(args))
+        print(f"{timer['id']} due {timer['due_at']}")
+    else:
+        raise SystemExit(f"Unknown timer command: {args.timer_command}")
+
+
+def cmd_team(args: argparse.Namespace) -> None:
+    from iam_service import IAMService
+    if args.team_command == "create":
+        team = IAMService.team_create(args.name, args.member)
+    elif args.team_command == "show":
+        team = IAMService.team_show(args.name)
+    elif args.team_command == "list":
+        print("\n".join(team["name"] for team in IAMService.team_list()) or "No teams.")
+        return
+    elif args.team_command == "member-add":
+        team = IAMService.team_add_member(args.name, args.member)
+    elif args.team_command == "member-remove":
+        team = IAMService.team_remove_member(args.name, args.member)
+    elif args.team_command == "leader-add":
+        team = IAMService.team_set_leader(args.name, args.member, True)
+    elif args.team_command == "leader-remove":
+        team = IAMService.team_set_leader(args.name, args.member, False)
+    elif args.team_command == "grant":
+        team = IAMService.team_grant(args.name, args.leader, args.capability)
+    elif args.team_command == "delete":
+        print(json.dumps(IAMService.team_delete(args.name), indent=2, sort_keys=True))
+        return
+    else:
+        raise SystemExit(f"Unknown team command: {args.team_command}")
+    print(json.dumps(team, indent=2, sort_keys=True))
+
+
 def cmd_reply(args: argparse.Namespace) -> None:
-    sender = address(args.project_root)
-    path = find_message(sender, args.id)
-    original = load(path)
-    originator = original.get("originator") or original["from"]
-    default_to = original["from"] if originator == sender else originator
-    payload = send_message(
-        sender,
-        resolve_names(args.to) or [default_to],
-        resolve_names(args.cc),
-        args.subject or f"Re: {original['subject']}",
-        args.body,
-        attachments(args.attach),
-        original.get("thread") or f"thr-{original['id']}",
-        original["id"],
-        originator,
-        args.ref,
+    from iam_service import IAMService
+    payload = IAMService(args.project_root).reply(
+        args.id, args.body, args.to, args.cc, args.subject, args.attach, args.ref,
+        getattr(args, "priority", "normal"),
     )
     print(payload["id"])
 
@@ -544,19 +621,21 @@ def cmd_self_test(_: argparse.Namespace) -> None:
                     pass
             finally:
                 os.environ.pop("INTERAGENTMAIL_WORKER", None)
-            cmd_chat(argparse.Namespace(chat_command="post", channel="reviewers", project_root=str(a), message="Status update", date="2026-07-10", channel_type=None, with_agent=None))
-            cmd_chat(argparse.Namespace(chat_command="seen", channel="reviewers", project_root=str(b), date="2026-07-10", lines=10))
-            chat = load_chat("reviewers", "2026-07-10")
+            cmd_chat(argparse.Namespace(chat_command="join", channel="reviewers", project_root=str(a), channel_type=None, with_agent=None))
+            cmd_chat(argparse.Namespace(chat_command="post", project_root=str(a), message="Status update", date=None))
+            cmd_chat(argparse.Namespace(chat_command="seen", channel="reviewers", project_root=str(b), date=None, lines=10))
+            chat = load_chat("reviewers")
             assert chat["messages"][0]["message"] == "Status update"
             assert "NexusGuild" in chat["messages"][0]["seen_by"]
             assert "AegisGrid" in chat["messages"][0]["seen_by"]
-            cmd_chat(argparse.Namespace(chat_command="post", channel="dm-nexus-aegis", project_root=str(a), message="Private note", date="2026-07-10", channel_type="private", with_agent="Aegis Grid"))
-            private = load_chat("dm-nexus-aegis", "2026-07-10")
+            cmd_chat(argparse.Namespace(chat_command="join", channel="dm-nexus-aegis", project_root=str(a), channel_type="private", with_agent="Aegis Grid"))
+            cmd_chat(argparse.Namespace(chat_command="post", project_root=str(a), message="Private note", date=None))
+            private = load_chat("dm-nexus-aegis")
             assert private["channelType"] == "private"
             assert private["participants"] == ["NexusGuild", "AegisGrid"]
-            cmd_chat(argparse.Namespace(chat_command="tail", channel="dm-nexus-aegis", project_root=str(b), lines=10, date="2026-07-10"))
+            cmd_chat(argparse.Namespace(chat_command="tail", channel="dm-nexus-aegis", project_root=str(b), lines=10, date=None))
             try:
-                cmd_chat(argparse.Namespace(chat_command="tail", channel="dm-nexus-aegis", project_root=str(c), lines=10, date="2026-07-10"))
+                cmd_chat(argparse.Namespace(chat_command="tail", channel="dm-nexus-aegis", project_root=str(c), lines=10, date=None))
                 raise AssertionError("private chat access did not fail")
             except SystemExit:
                 pass
@@ -591,17 +670,16 @@ def parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("chat")
     chat_sub = sp.add_subparsers(dest="chat_command", required=True)
     post = chat_sub.add_parser("post")
-    post.add_argument("channel")
     post.add_argument("--project-root")
+    post.add_argument("--mailbox", help="Use a human or project mailbox address instead of a project folder.")
     post.add_argument("--message", required=True)
     post.add_argument("--date")
-    post.add_argument("--type", choices=("public", "private"), dest="channel_type")
-    post.add_argument("--with", dest="with_agent", help="Second participant for private channels.")
     post.set_defaults(func=cmd_chat)
 
     tail = chat_sub.add_parser("tail")
     tail.add_argument("channel")
     tail.add_argument("--project-root")
+    tail.add_argument("--mailbox", help="Use a human or project mailbox address instead of a project folder.")
     tail.add_argument("--lines", type=int, default=10)
     tail.add_argument("--date")
     tail.set_defaults(func=cmd_chat)
@@ -609,9 +687,85 @@ def parser() -> argparse.ArgumentParser:
     seen = chat_sub.add_parser("seen")
     seen.add_argument("channel")
     seen.add_argument("--project-root")
+    seen.add_argument("--mailbox", help="Use a human or project mailbox address instead of a project folder.")
     seen.add_argument("--lines", type=int, default=10)
     seen.add_argument("--date")
     seen.set_defaults(func=cmd_chat)
+
+    join = chat_sub.add_parser("join")
+    join.add_argument("channel")
+    join.add_argument("--project-root")
+    join.add_argument("--mailbox", help="Use a human or project mailbox address instead of a project folder.")
+    join.add_argument("--type", choices=("public", "private"), dest="channel_type")
+    join.add_argument("--with", dest="with_agent", help="Second participant when creating a private channel.")
+    join.set_defaults(func=cmd_chat)
+
+    leave = chat_sub.add_parser("leave")
+    leave.add_argument("--project-root")
+    leave.add_argument("--mailbox", help="Use a human or project mailbox address instead of a project folder.")
+    leave.set_defaults(func=cmd_chat)
+
+    subscriptions = chat_sub.add_parser("subscriptions")
+    subscriptions.add_argument("--project-root")
+    subscriptions.add_argument("--mailbox", help="Use a human or project mailbox address instead of a project folder.")
+    subscriptions.set_defaults(func=cmd_chat)
+
+    sp = sub.add_parser("timer", help="Create and manage temporary IAM reminders.")
+    timer_sub = sp.add_subparsers(dest="timer_command", required=True)
+    for timer_name in ("set", "snooze"):
+        timer = timer_sub.add_parser(timer_name)
+        if timer_name == "set":
+            timer.add_argument("--note", required=True)
+            timer.add_argument("--team", help="Authorized team to expand into independent recipient timers.")
+            timer.add_argument("--to", help="One explicitly authorized teammate mailbox or display name.")
+        else:
+            timer.add_argument("id")
+        timer.add_argument("--in", dest="in_duration")
+        timer.add_argument("--at")
+        timer.add_argument("--project-root")
+        timer.add_argument("--mailbox")
+        timer.set_defaults(func=cmd_timer)
+    timer = timer_sub.add_parser("list")
+    timer.add_argument("--due-only", action="store_true")
+    timer.add_argument("--project-root")
+    timer.add_argument("--mailbox")
+    timer.set_defaults(func=cmd_timer)
+    timer = timer_sub.add_parser("clear")
+    timer.add_argument("id")
+    timer.add_argument("--project-root")
+    timer.add_argument("--mailbox")
+    timer.set_defaults(func=cmd_timer)
+    timer = timer_sub.add_parser("cancel")
+    timer.add_argument("id")
+    timer.add_argument("--project-root")
+    timer.add_argument("--mailbox")
+    timer.set_defaults(func=cmd_timer)
+
+    sp = sub.add_parser("team", help="Human-administered local IAM teams and leadership grants.")
+    team_sub = sp.add_subparsers(dest="team_command", required=True)
+    team = team_sub.add_parser("create")
+    team.add_argument("name")
+    team.add_argument("--member", action="append", default=[])
+    team.set_defaults(func=cmd_team)
+    team = team_sub.add_parser("show")
+    team.add_argument("name")
+    team.set_defaults(func=cmd_team)
+    team = team_sub.add_parser("list")
+    team.set_defaults(func=cmd_team)
+    for command in ("member-add", "member-remove", "leader-add", "leader-remove"):
+        team = team_sub.add_parser(command)
+        team.add_argument("name")
+        team.add_argument("member")
+        team.set_defaults(func=cmd_team)
+    team = team_sub.add_parser("grant")
+    team.add_argument("name")
+    team.add_argument("--leader", required=True)
+    team.add_argument("--capability", required=True,
+                      choices=("timer.schedule_team", "timer.schedule", "team.view", "team.coordinate", "team.manage_members"))
+    team.set_defaults(func=cmd_team)
+    team = team_sub.add_parser("delete")
+    team.add_argument("name")
+    team.set_defaults(func=cmd_team)
 
     sp = sub.add_parser("send")
     sp.add_argument("--project-root")
@@ -623,6 +777,7 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--ref", action="append", help="Related message id. Repeat or comma-separate.")
     sp.add_argument("--thread", help="Existing thread id. Omit to create a new thread.")
     sp.add_argument("--originator", help="Original requester for an existing thread. Defaults to sender.")
+    sp.add_argument("--priority", choices=("normal", "urgent"), default="normal")
     sp.set_defaults(func=cmd_send)
 
     sp = sub.add_parser("request")
@@ -635,6 +790,7 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--ref", action="append", help="Related message id. Repeat or comma-separate.")
     sp.add_argument("--thread", help="Existing thread id. Omit to create a new thread.")
     sp.add_argument("--originator", help="Original requester for an existing thread. Defaults to sender.")
+    sp.add_argument("--priority", choices=("normal", "urgent"), default="normal")
     sp.add_argument("--wait-seconds", type=int, default=30)
     sp.add_argument("--tries", type=int, default=3)
     sp.set_defaults(func=cmd_request)
@@ -648,6 +804,7 @@ def parser() -> argparse.ArgumentParser:
     sp.add_argument("--body", required=True)
     sp.add_argument("--attach", action="append", help="Referenced file path. Repeat or comma-separate.")
     sp.add_argument("--ref", action="append", help="Related message id. Repeat or comma-separate.")
+    sp.add_argument("--priority", choices=("normal", "urgent"), default="normal")
     sp.set_defaults(func=cmd_reply)
 
     for name in ("read", "archive"):

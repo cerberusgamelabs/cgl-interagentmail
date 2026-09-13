@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import interagentmail as iam
-from iam_codex_bridge import AppServerError, DeliveryState, MailboxBridge, delivery_prompt
+from iam_codex_bridge import AppServerError, DeliveryState, MailboxBridge, chat_delivery_prompt, delivery_prompt
 from iam_service import IAMService
 
 
@@ -23,9 +23,14 @@ class FakeAppServerClient:
         if method == "thread/list":
             return {"data": self.threads}
         if method == "thread/read":
-            return {"thread": {"id": params["threadId"], "status": {"type": self.status}}}
+            thread = {"id": params["threadId"], "status": {"type": self.status}}
+            if params.get("includeTurns"):
+                thread["turns"] = [{"id": "turn-1", "status": "inProgress"}]
+            return {"thread": thread}
         if method == "turn/start":
             return {"turn": {"id": "turn-1", "status": "inProgress"}}
+        if method == "turn/steer":
+            return {"turnId": params["expectedTurnId"]}
         if method == "thread/start":
             return {"thread": {"id": "created-thread", "status": {"type": "idle"}}}
         raise AssertionError(f"Unexpected method {method}")
@@ -77,6 +82,15 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.state.is_delivered(message["id"]))
         self.assertFalse(await bridge.deliver_once())
 
+    async def test_delegated_mail_prompt_requires_owner_approval_for_changes(self) -> None:
+        message = self.beta.send(
+            ["Alpha"], "Delegated request", "Please change deployment settings.",
+            metadata={"webconnect": {"kind": "delegated_webconnect", "owner_mailbox": "Owner", "approval_required": True}},
+        )
+        prompt = delivery_prompt([message])
+        self.assertIn("DELEGATED: owner approval required for changes", prompt)
+        self.assertIn("contact the recorded node-owner mailbox for approval", prompt)
+
     async def test_active_thread_keeps_mail_queued(self) -> None:
         message = self.beta.send(["Alpha"], "Later", "Wait until idle.")
         client = FakeAppServerClient(status="active")
@@ -87,6 +101,40 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await bridge.deliver_once())
         self.assertFalse(self.state.is_delivered(message["id"]))
         self.assertFalse(any(method == "turn/start" for method, _ in client.calls))
+
+    async def test_urgent_mail_steers_active_turn_and_normal_mail_stays_queued(self) -> None:
+        normal = self.beta.send(["Alpha"], "Later", "Queue this.")
+        urgent = self.beta.send(["Alpha"], "Now", "Steer this.", priority="urgent")
+        client = FakeAppServerClient(status="active")
+        self.state.thread_id = "thread-1"
+        self.state.save()
+        bridge = MailboxBridge(self.alpha, self.state, client)
+
+        self.assertTrue(await bridge.deliver_once())
+        steer = next(params for method, params in client.calls if method == "turn/steer")
+        self.assertEqual("turn-1", steer["expectedTurnId"])
+        self.assertIn(urgent["id"], steer["input"][0]["text"])
+        self.assertNotIn(normal["id"], steer["input"][0]["text"])
+        self.assertTrue(self.state.is_delivered(urgent["id"]))
+        self.assertFalse(self.state.is_delivered(normal["id"]))
+
+    async def test_urgent_mail_waits_while_turn_is_waiting_for_approval(self) -> None:
+        urgent = self.beta.send(["Alpha"], "Now", "Wait safely.", priority="urgent")
+        client = FakeAppServerClient(status="active")
+        original_request = client.request
+        async def request(method: str, params: dict[str, Any]) -> Any:
+            if method == "thread/read":
+                client.calls.append((method, params))
+                return {"thread": {"id": params["threadId"], "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}
+            return await original_request(method, params)
+        client.request = request  # type: ignore[method-assign]
+        self.state.thread_id = "thread-1"
+        self.state.save()
+        bridge = MailboxBridge(self.alpha, self.state, client)
+
+        self.assertFalse(await bridge.deliver_once())
+        self.assertFalse(self.state.is_delivered(urgent["id"]))
+        self.assertFalse(any(method == "turn/steer" for method, _ in client.calls))
 
     async def test_explicit_thread_wins_over_saved_thread(self) -> None:
         self.state.thread_id = "old-thread"
@@ -112,7 +160,7 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("thread/read", client.calls[0][0])
         self.assertEqual(("thread/resume", {"threadId": "stored-session"}), client.calls[1])
 
-    async def test_missing_explicit_thread_is_replaced_for_supervisor(self) -> None:
+    async def test_missing_explicit_thread_is_preserved_for_supervisor(self) -> None:
         self.state.thread_id = "lost-session"
         self.state.save()
         client = MissingThreadClient()
@@ -124,11 +172,11 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
             create_thread=True,
         )
 
-        thread = await bridge.attach_thread()
+        with self.assertRaisesRegex(AppServerError, "binding was preserved"):
+            await bridge.attach_thread()
 
-        self.assertEqual("created-thread", thread["id"])
-        self.assertEqual("created-thread", self.state.thread_id)
-        self.assertTrue(any(method == "thread/start" for method, _ in client.calls))
+        self.assertEqual("lost-session", self.state.thread_id)
+        self.assertFalse(any(method == "thread/start" for method, _ in client.calls))
 
     async def test_automatic_selection_rejects_multiple_loaded_threads(self) -> None:
         client = FakeAppServerClient(threads=[
@@ -175,6 +223,39 @@ class MailboxBridgeTests(unittest.IsolatedAsyncioTestCase):
         }])
         self.assertIn("1-a", prompt)
         self.assertNotIn("sensitive body", prompt)
+
+    async def test_chat_delivery_starts_idle_turn_with_channel_prefix(self) -> None:
+        client = FakeAppServerClient()
+        self.state.thread_id = "thread-1"
+        self.state.save()
+        bridge = MailboxBridge(self.alpha, self.state, client)
+        entry = {"id": "chat-1", "agent": "Beta", "address": "Beta", "message": "Hello Alpha", "type": "message"}
+
+        self.assertTrue(await bridge.deliver_chat("reviewers", [entry]))
+        start = next(params for method, params in client.calls if method == "turn/start")
+        self.assertIn("[reviewers] Beta: Hello Alpha", start["input"][0]["text"])
+
+    async def test_chat_delivery_steers_active_turn(self) -> None:
+        client = FakeAppServerClient(status="active")
+        self.state.thread_id = "thread-1"
+        self.state.save()
+        bridge = MailboxBridge(self.alpha, self.state, client)
+        entry = {"id": "chat-1", "agent": "Beta", "address": "Beta", "message": "Hello Alpha", "type": "message"}
+
+        self.assertTrue(await bridge.deliver_chat("reviewers", [entry]))
+        steer = next(params for method, params in client.calls if method == "turn/steer")
+        self.assertIn("[reviewers] Beta: Hello Alpha", steer["input"][0]["text"])
+
+    async def test_timer_delivery_starts_idle_turn(self) -> None:
+        client = FakeAppServerClient()
+        self.state.thread_id = "thread-1"
+        self.state.save()
+        bridge = MailboxBridge(self.alpha, self.state, client)
+        timer = {"id": "timer-1", "note": "Check the audit."}
+
+        self.assertTrue(await bridge.deliver_timer(timer))
+        start = next(params for method, params in client.calls if method == "turn/start")
+        self.assertIn("[timer] Reminder timer-1: Check the audit.", start["input"][0]["text"])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 name: Publish to PyPI
 
 on:
+  push:
+    tags: ['v*']
   release:
     types: [published]
   workflow_dispatch:
@@ -8,7 +10,7 @@ on:
       tag:
         description: Git tag to build and publish
         required: true
-        default: v1.3.1
+        default: v1.4.0
 
 concurrency:
   group: pypi-publish
@@ -22,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag || github.ref_name }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -31,6 +33,25 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: python -m build
       - run: python -m twine check dist/*
+      - name: Check release version and package privacy
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, tarfile, tomllib, zipfile
+          version = tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version']
+          assert os.environ['RELEASE_TAG'] == f'v{version}', 'Tag/package version mismatch'
+          forbidden = {'DEV', 'mailboxes', 'chats', 'teams', 'attachments', 'orphaned-mailboxes', 'run', 'reports', '.venv', '.codex', '.agents', 'InterAgentChatReader'}
+          private = {'config.json', 'web.json', 'webconnect.json', 'webconnect-state.json'}
+          for path in pathlib.Path('dist').iterdir():
+              with zipfile.ZipFile(path) if path.suffix == '.whl' else tarfile.open(path) as archive:
+                  names = archive.namelist() if path.suffix == '.whl' else archive.getnames()
+              for name in names:
+                  parts = pathlib.PurePosixPath(name).parts
+                  assert not (set(parts) & forbidden), name
+                  assert parts[-1] not in private and not parts[-1].startswith('.env'), name
+              assert any(name.endswith('/iam_webconnect.py') or name == 'iam_webconnect.py' for name in names)
+          PY
       - uses: actions/upload-artifact@v7
         with:
           name: python-distributions
@@ -51,3 +72,29 @@ jobs:
           name: python-distributions
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist/
+      - name: Publish release assets and notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag || github.ref_name }}
+        run: |
+          (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS.txt)
+          awk '/^## / { if (section++) exit; next } section { print }' CHANGELOG.md > release-notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "InterAgentMail $RELEASE_TAG" --notes-file release-notes.md
+          fi

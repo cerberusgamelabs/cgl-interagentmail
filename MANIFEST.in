@@ -14,6 +14,9 @@ prune .git
 prune .venv
 prune build
 prune chats
+prune attachments
+prune teams
+prune orphaned-mailboxes
 prune DEV
 prune dist
 prune InterAgentChatReader
@@ -23,6 +26,10 @@ prune reports
 prune skills
 exclude config.json
 exclude web.json
+exclude webconnect.json
+exclude webconnect-state.json
+exclude .env
+exclude .env.*
 exclude InterAgentChatReader.zip
 global-exclude *.py[cod]
 global-exclude __pycache__

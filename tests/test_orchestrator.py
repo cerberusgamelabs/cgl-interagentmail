@@ -18,12 +18,14 @@ from iam_orchestrator import (
     CHECK_FAIL,
     INTEGRATION_SCHEMA_VERSION,
     MCP_BEGIN,
+    cmd_start,
     cmd_report,
     collect_diagnostics,
     configure_web,
     create_user_mailbox,
     load_web_config,
     main,
+    pid_alive,
     registered_projects,
     render_report,
     sanitize_report,
@@ -98,6 +100,27 @@ class OrchestratorSetupTests(unittest.TestCase):
         self.assertEqual('model = "gpt-5.6-sol"\n', config_text)
         self.assertNotIn(MCP_BEGIN, config_text)
 
+    def test_setup_explicitly_claims_only_an_untouched_generic_mailbox(self) -> None:
+        iam.ensure_box("ExampleProject")
+
+        result = setup_project(self.project, claim_empty_mailbox=True)
+
+        self.assertTrue(result["legacy_mailbox_reused"])
+        self.assertEqual("project", iam.profile("ExampleProject")["kind"])
+        self.assertEqual(str(self.project.resolve()), iam.profile("ExampleProject")["project_root"])
+
+    def test_setup_refuses_to_claim_a_generic_mailbox_with_mail(self) -> None:
+        iam.ensure_box("ExampleProject")
+        iam.write_atomic(
+            iam.mailbox("ExampleProject") / "inbox" / "message.json",
+            {"id": "message", "body": "preserve me"},
+        )
+
+        with self.assertRaises(SystemExit) as raised:
+            setup_project(self.project, claim_empty_mailbox=True)
+
+        self.assertEqual("IAM_ADDRESS_COLLISION", raised.exception.error_code)
+
     def test_setup_rejects_conflicting_unmanaged_mcp_section(self) -> None:
         config_path = self.project / ".codex" / "config.toml"
         config_path.write_text("[mcp_servers.interagentmail]\ncommand = 'custom'\n", encoding="utf-8")
@@ -156,6 +179,47 @@ class OrchestratorSetupTests(unittest.TestCase):
 
         self.assertEqual(str(first.resolve()), iam.profile("SharedName")["project_root"])
         self.assertFalse((second / ".codex" / "config.toml").exists())
+
+    def test_root_command_preserves_registered_projects(self) -> None:
+        setup_project(self.project)
+        new_root = self.root / "projects"
+        new_root.mkdir()
+
+        iam.main(["root", str(new_root)])
+
+        config = iam.load(iam.CONFIG)
+        self.assertEqual(str(new_root.resolve()), config["project_root"])
+        self.assertIn("ExampleProject", config["projects"])
+
+
+class WindowsProcessTests(unittest.TestCase):
+    class _Kernel32:
+        def __init__(self, exit_code: int) -> None:
+            self.exit_code = exit_code
+            self.closed = False
+
+        def OpenProcess(self, _access: int, _inherit: bool, _pid: int) -> int:
+            return 123
+
+        def GetExitCodeProcess(self, _handle: int, result: Any) -> int:
+            result._obj.value = self.exit_code
+            return 1
+
+        def CloseHandle(self, _handle: int) -> int:
+            self.closed = True
+            return 1
+
+    def test_windows_exited_process_is_not_alive(self) -> None:
+        kernel32 = self._Kernel32(exit_code=0)
+        with patch("iam_orchestrator.os.name", "nt"), patch("iam_orchestrator.ctypes.windll", type("Windll", (), {"kernel32": kernel32})()):
+            self.assertFalse(pid_alive(33040))
+        self.assertTrue(kernel32.closed)
+
+    def test_windows_still_active_process_is_alive(self) -> None:
+        kernel32 = self._Kernel32(exit_code=259)
+        with patch("iam_orchestrator.os.name", "nt"), patch("iam_orchestrator.ctypes.windll", type("Windll", (), {"kernel32": kernel32})()):
+            self.assertTrue(pid_alive(33040))
+        self.assertTrue(kernel32.closed)
 
 
 class IntegrationContractTests(unittest.TestCase):
@@ -552,6 +616,24 @@ class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], FakeSupervisorClient.instances)
         state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
         self.assertIsNone(state.thread_id)
+
+    async def test_start_only_starts_shared_services_without_loading_mailbox_threads(self) -> None:
+        args = argparse.Namespace(url="ws://127.0.0.1:4500")
+        output = io.StringIO()
+        with (
+            patch("iam_orchestrator.AppServerClient", FakeSupervisorClient),
+            patch("iam_orchestrator.ensure_appserver", return_value="started") as appserver,
+            patch("iam_orchestrator.ensure_daemon", return_value="started") as supervisor,
+            redirect_stdout(output),
+        ):
+            cmd_start(args)
+
+        appserver.assert_called_once_with(args.url)
+        supervisor.assert_called_once_with(args.url)
+        self.assertEqual([], FakeSupervisorClient.instances)
+        state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        self.assertIsNone(state.thread_id)
+        self.assertNotIn("Codex mailboxes", output.getvalue())
 
     async def test_supervisor_creates_and_pins_thread_only_for_new_mail(self) -> None:
         self.baseline(self.project)

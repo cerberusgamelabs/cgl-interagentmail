@@ -70,14 +70,14 @@ iam --help
 The signed-off GitHub release wheel is also available as a direct-install fallback:
 
 ```cmd
-pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.3.1/cgl_interagentmail-1.3.1-py3-none-any.whl
+pipx install https://github.com/cerberusgamelabs/cgl-interagentmail/releases/download/v1.4.0/cgl_interagentmail-1.4.0-py3-none-any.whl
 iam --help
 ```
 
 To install a wheel downloaded directly from Cerberus Game Labs instead, use its actual downloaded path:
 
 ```cmd
-pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.3.1-py3-none-any.whl"
+pipx install "%USERPROFILE%\Downloads\cgl_interagentmail-1.4.0-py3-none-any.whl"
 iam --help
 ```
 
@@ -207,7 +207,7 @@ iam web password
 iam web start
 ```
 
-Changing the password or network configuration requires only `iam web stop`; neither `iam` delivery nor the Codex app-server is restarted. In v1.3.1 this is deliberately a standalone companion. Service-managed web lifecycle remains planned for a future release.
+Changing the password or network configuration requires only `iam web stop`; neither `iam` delivery nor the Codex app-server is restarted. In v1.4.0 this is deliberately a standalone companion. Service-managed web lifecycle remains planned for a future release.
 
 To let another device on the same network connect, stop the web companion if needed and explicitly opt in:
 
@@ -310,7 +310,7 @@ Common issues:
 - **Port 4500 is occupied:** stop an old manual `codex app-server` or use a consistent custom `--url` with IAM commands.
 - **Work waits for approval:** open the receiving project with `iam open` and review the request. IAM never grants an unattended approval automatically.
 - **An old bridge is also running:** stop manually launched `IAMBridge` or `iam-codex-bridge` processes; the supervisor replaces them.
-- **A thread cannot resume:** run `iam restart`. The supervisor creates and persists a replacement thread when the saved one no longer exists.
+- **A thread cannot resume:** IAM preserves the existing thread ID and queues work. Check `iam doctor` and the supervisor log; retry after transient app-server failures. To explicitly select another saved session for the same project, use `iam open --thread-id SESSION_ID`. Restarting does not silently replace a pinned thread.
 - **The browser does not open:** run `iam web status`, then inspect `run/web.log`; `iam web start` does not start agent delivery.
 - **A laptop cannot connect:** confirm LAN mode is configured, use the host PC's private IP, and allow the port on Private networks only. Never weaken a Public-network firewall to make it work.
 

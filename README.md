@@ -58,6 +58,45 @@ iam web start
 
 LAN mode uses plain HTTP plus application-password authentication; it is not end-to-end encrypted. Enable it only on a trusted, password-protected WPA2/WPA3 network, allow only Private networks in the operating-system firewall, keep the password private, and never port-forward the IAM web port. Anyone who gains access can read messages, send agent instructions, and potentially cause project changes or corruption.
 
+## Remote WebConnect messaging
+
+Version 1.4 adds an optional outbound client for a compatible IAM WebConnect relay. It allows remote browser messaging without exposing `iam web start`, Codex, or any local service to the internet: the local machine makes an outbound secure WebSocket connection instead.
+
+Create or choose the human mailbox that represents the remote account, then use the node credentials issued by the relay administrator:
+
+```console
+iam user create yggdrassoftgaming --display-name "Liliana"
+iam connect configure --server-url wss://iamwebconnect.cerberusgamelabs.xyz --node-id YOUR_NODE_ID --node-token YOUR_NODE_TOKEN --human-mailbox yggdrassoftgaming
+iam connect start
+iam connect status
+```
+
+Repeat `--human-mailbox` only when one trusted local node intentionally hosts
+more than one separately scoped headless identity, such as a ChatGPT MCP
+companion. IAM preserves the exact sender identity for each inbound message and
+exports replies addressed to that identity only:
+
+```console
+iam connect configure --server-url wss://relay.example --node-id YOUR_NODE_ID --node-token YOUR_NODE_TOKEN --human-mailbox yggdrassoftgaming --human-mailbox echo
+```
+
+Use `iam connect stop` to stop only this connector. It does not restart the IAM supervisor, Codex app-server, or local browser companion. Any compatible `wss://` relay URL may be used; Cerberus Game Labs hosting is optional. See [IAM WebConnect](https://iamwebconnect.cerberusgamelabs.xyz) for self-hosting, operator, and security information.
+
+When a WebConnect node owner grants a separate account delegated access, create
+that account's human mailbox locally and add it as another `--human-mailbox`
+on the existing connector. A delegated message is stored with protected
+WebConnect metadata and its Codex delivery prompt requires owner-mailbox
+approval before any mutating or external action; ordinary questions and
+non-mutating discussion may be handled normally.
+
+To add a delegated mailbox later without repeating node credentials, use
+`iam connect update --human-mailbox ADDRESS`. It preserves every unspecified
+setting and reloads only a running WebConnect connector. Use
+`iam connect removeuser --human-mailbox ADDRESS` to remove one local mailbox;
+revoke that account in WebConnect Settings first, otherwise the relay will
+safely reject the connector because its authorized mailbox list no longer
+matches.
+
 Source code, releases, and issue tracking are hosted at <https://github.com/cerberusgamelabs/cgl-interagentmail>.
 
 ## Everyday commands
@@ -70,6 +109,12 @@ iam user create ADDRESS
 iam web setup ADDRESS
 iam web start
 iam web status
+iam connect configure --server-url URL --node-id ID --node-token TOKEN --human-mailbox ADDRESS
+iam connect update [--server-url URL] [--node-id ID] [--node-token TOKEN] [--human-mailbox ADDRESS]
+iam connect removeuser --human-mailbox ADDRESS
+iam connect start
+iam connect status
+iam connect stop
 iam open [PROJECT]
 iam restart
 iam stop
@@ -80,13 +125,57 @@ iam capabilities --json
 ```
 
 - `iam status` shows services, projects, and pinned thread IDs; `--json` provides stable schema 1.0 output.
+- `iam open` resumes the mailbox's pinned Codex session. To deliberately move a mailbox to a different existing session, use `iam open --thread-id <session-id>` from that project; IAM validates the session before replacing the pin.
 - `iam doctor` runs read-only health checks for IAM, Codex, services, project registration, MCP configuration, mailboxes, safety policy, and resumable threads.
 - `iam report` creates a privacy-sanitized Markdown support report under the IAM data directory.
-- `iam user` manages human mailboxes; `iam web` manages the separate authenticated browser companion.
+- `iam user` manages human mailboxes; `iam web` manages the separate authenticated browser companion; `iam connect` manages an outbound WebConnect transport client.
 - `iam open` resumes the saved project thread, or starts a new remote session when the project has not needed one yet.
 - `iam stop` stops mail delivery but leaves the shared app-server running.
+- Messages default to `normal`. Send `--priority urgent` only when a running agent needs a safe-stop notice; urgent mail steers active turns but never interrupts a command or bypasses approval.
 - `iam stop --all` stops both IAM-managed background services.
 - `iam unregister` removes IAM's managed MCP block and project registration while preserving mailbox data.
+
+## Timers and teams
+
+IAM timers are durable, one-shot reminders for a mailbox. They survive IAM restarts, wake the target through the existing supervisor when due, and disappear completely when the recipient clears them. They are not mail and do not enter the inbox/archive lifecycle.
+
+```console
+interagentmail timer set --project-root "C:\Projects\NexusGuild" --in 45m --note "Re-check the audit response."
+interagentmail timer list --project-root "C:\Projects\NexusGuild"
+interagentmail timer snooze TIMER_ID --project-root "C:\Projects\NexusGuild" --in 30m
+interagentmail timer clear TIMER_ID --project-root "C:\Projects\NexusGuild"
+```
+
+Teams are local, human-administered coordination groups. Leadership alone grants no power: a leader needs an explicit capability grant before scheduling a team-wide reminder. A team reminder expands into independent recipient timers, so each agent can clear or snooze its own without affecting anyone else.
+
+```console
+interagentmail team create reviewers --member NexusGuild --member AegisGrid
+interagentmail team leader-add reviewers NexusGuild
+interagentmail team grant reviewers --leader NexusGuild --capability timer.schedule_team
+interagentmail timer set --project-root "C:\Projects\NexusGuild" --team reviewers --in 2h --note "Post findings in #reviewers."
+```
+
+Any member can also send mail without memorizing a roster or leader name:
+
+```console
+interagentmail send --project-root "C:\Projects\NexusGuild" --to team:reviewers --subject "Status" --body "Please post your current findings."
+interagentmail send --project-root "C:\Projects\NexusGuild" --to leader:reviewers --subject "Escalation" --body "I need a coordination decision."
+```
+
+`team:<name>` expands to the team's other current members and `leader:<name>`
+expands to its other active leaders. IAM permits either alias only to a current
+member of that team; aliases never send a copy back to the sender.
+
+An administrator may delegate membership maintenance to one active leader,
+without allowing that leader to change roles or grants:
+
+```console
+interagentmail team grant art-team --leader Maris --capability team.manage_members
+```
+
+That leader can then use `iam_team_add_member` and `iam_team_remove_member`
+through IAM MCP for that team only. Delegated leaders cannot remove themselves
+or another active leader, assign leadership, or alter permissions.
 
 ## Setup behavior
 
@@ -103,6 +192,18 @@ Use `iam setup --process-existing` when existing inbox messages should be delive
 Installed releases keep data under `%LOCALAPPDATA%\InterAgentMail` on Windows or `~/.local/share/interagentmail` on macOS/Linux. Set `INTERAGENTMAIL_HOME` before setup to use another shared data directory.
 
 Project folder basenames become mailbox addresses. IAM records mailbox ownership and refuses to register two different project roots with the same address before changing either project or mailbox.
+
+If `InterAgentMail init` was run before `iam setup`, IAM deliberately refuses to
+claim that unowned mailbox by default. For an untouched default mailbox only
+(no mail, no timers, no custom profile, and no human identity), explicitly
+claim it during setup:
+
+```console
+iam setup "C:\Projects\NewAgent" --claim-empty-mailbox
+```
+
+The flag never migrates or removes existing data; IAM rejects anything other
+than the exact empty mailbox shape created by `InterAgentMail init`.
 
 ## Automation and reviewer platforms
 
@@ -156,6 +257,7 @@ Agents normally use the project-bound InterAgentMail MCP tools. People and fallb
 
 ```console
 interagentmail send --project-root "C:\Projects\MainApp" --to SecurityReviewer --subject "Security review" --body "Review the current release and send back actionable findings."
+interagentmail send --project-root "C:\Projects\MainApp" --to SecurityReviewer --priority urgent --subject "Release blocker" --body "At your next safe stopping point, read this and reassess the release."
 ```
 
 The receiving supervisor wakes the correct Codex thread. The agent reads the message through MCP, performs the work, sends a substantive reply when appropriate, and archives the message only after it is handled.

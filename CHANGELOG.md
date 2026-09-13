@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 - 2026-09-13
+
+- Added optional WebConnect transport commands (`iam connect configure|start|status|stop`) for secure outbound connections to any compatible hosted or self-hosted relay.
+- Added separately scoped human/headless mailboxes per WebConnect node, with deduplicated inbound delivery, acknowledged outbound reply spooling, reconnect recovery, and identity validation.
+- Added incremental WebConnect configuration updates, mailbox removal, attachment transfer with integrity checks, and delegated-message owner-approval guidance.
+- Kept WebConnect separate from local `iam web`: it never exposes a local HTTP interface, Codex, app-server, filesystem, or shell to the remote relay.
+- Added structured `normal` and `urgent` mail priorities. Older messages and callers without a priority remain `normal`.
+- Urgent mail can steer an active Codex turn with a safe-stop notice, while normal mail remains queued until idle and approval-paused turns remain undisturbed.
+- Added priority controls to the CLI, MCP tools, and authenticated browser composer.
+- Preserved a mailbox's pinned Codex thread when the app-server cannot resume it. IAM no longer clears the ID, starts a replacement thread, or silently switches to another matching session; mail remains queued until the user explicitly selects a replacement.
+- Added single-channel chat subscriptions, join/leave events, and supervisor-driven delivery of new chat messages.
+- Added durable one-shot timers with clear, cancel, and snooze commands, plus permission-controlled reminders for other mailboxes and teams.
+- Added teams, explicit leadership capability grants, delegated membership management, and member-scoped team/leader mail addressing.
+- Expanded diagnostics to cover teams and timers without exposing their contents, and excluded attachment stores, team data, and connector credentials from release packages.
+- Added explicit claiming of pristine, unowned mailboxes during setup; existing user identities and mail remain protected from implicit migration.
+- Improved Windows process-liveness checks and allowed large thread responses during bridge attachment.
+- Validated incoming attachment paths, filenames, sizes, and digests before writing WebConnect downloads to local storage.
 
 ## 1.3.1 - 2026-08-10
 

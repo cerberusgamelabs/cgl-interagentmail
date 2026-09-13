@@ -1,8 +1,8 @@
 # InterAgentMail integration interface
 
-InterAgentMail 1.3.1 provides a stable local CLI interface for reviewer-pack registries, project launchers, and other automation. Integrators should discover support with `iam capabilities --json` instead of inferring behavior from the installed package version.
+InterAgentMail 1.4.0 provides a stable local CLI interface for reviewer-pack registries, project launchers, and other automation. Integrators should discover support with `iam capabilities --json` instead of inferring behavior from the installed package version.
 
-The integration schema is versioned separately from the IAM package. InterAgentMail 1.3.1 implements schema `1.0`.
+The integration schema is versioned separately from the IAM package. InterAgentMail 1.4.0 implements schema `1.0`.
 
 ## Compatibility discovery
 
@@ -124,6 +124,6 @@ A reviewer platform should:
 5. Use `iam status --json` and project-scoped doctor checks for health displays.
 6. Run `iam unregister PATH --json` when removing the integration. Decide separately whether the user wants preserved mailbox data deleted; IAM never deletes it during unregister.
 
-In v1.3.1, `features.web_managed_by_iam_service` is `false`: web lifecycle commands affect only the companion. LAN configuration requires explicit risk acknowledgment, and callers must surface the trusted WPA2/WPA3 network warning.
+In v1.4.0, `features.web_managed_by_iam_service` is `false`: web lifecycle commands affect only the companion. LAN configuration requires explicit risk acknowledgment, and callers must surface the trusted WPA2/WPA3 network warning.
 
 Do not parse human-readable CLI output. Do not edit IAM's `config.json`, mailbox profiles, bridge state, or managed MCP markers directly.

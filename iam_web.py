@@ -552,6 +552,12 @@ class IAMWebHandler(BaseHTTPRequestHandler):
                 rows = self.server.app.service.list_messages(folder, limit)
                 self._json(HTTPStatus.OK, {"ok": True, "data": {"folder": folder, "messages": rows}})
                 return
+            if parsed.path == "/api/timers":
+                self._json(HTTPStatus.OK, {"ok": True, "data": {"timers": self.server.app.service.timer_list()}})
+                return
+            if parsed.path == "/api/teams":
+                self._json(HTTPStatus.OK, {"ok": True, "data": {"teams": IAMService.team_list()}})
+                return
         except (IAMError, WebError) as exc:
             self._error(HTTPStatus.BAD_REQUEST, getattr(exc, "code", "IAM_WEB_OPERATION_FAILED"), str(exc))
             return
@@ -591,6 +597,7 @@ class IAMWebHandler(BaseHTTPRequestHandler):
                 recipients = payload.get("to")
                 subject = payload.get("subject")
                 body = payload.get("body")
+                priority = payload.get("priority", "normal")
                 if (
                     not isinstance(recipients, list)
                     or not recipients
@@ -602,6 +609,8 @@ class IAMWebHandler(BaseHTTPRequestHandler):
                     raise WebError("IAM_WEB_REQUEST_INVALID", "Subject must contain between 1 and 300 characters.")
                 if not isinstance(body, str) or not body.strip() or len(body) > 100_000:
                     raise WebError("IAM_WEB_REQUEST_INVALID", "Message must contain between 1 and 100000 characters.")
+                if priority not in {"normal", "urgent"}:
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "Priority must be normal or urgent.")
                 resolved_recipients = iam.resolve_names(recipients)
                 missing = [recipient for recipient in resolved_recipients if not iam.mailbox(recipient).is_dir()]
                 if missing:
@@ -609,7 +618,7 @@ class IAMWebHandler(BaseHTTPRequestHandler):
                         "IAM_WEB_RECIPIENT_NOT_FOUND",
                         "Unknown mailbox recipient: " + ", ".join(missing),
                     )
-                message = self.server.app.service.send(resolved_recipients, subject.strip(), body.strip())
+                message = self.server.app.service.send(resolved_recipients, subject.strip(), body.strip(), priority=priority)
                 self._json(HTTPStatus.CREATED, {"ok": True, "data": {"message": message}})
                 return
             if parsed.path == "/api/reply":
@@ -633,6 +642,53 @@ class IAMWebHandler(BaseHTTPRequestHandler):
                     raise WebError("IAM_WEB_REQUEST_INVALID", "A valid message ID is required.")
                 archived = self.server.app.service.archive(message_id)
                 self._json(HTTPStatus.OK, {"ok": True, "data": archived})
+                return
+            if parsed.path == "/api/timer/set":
+                note, due_at = payload.get("note"), payload.get("due_at")
+                if not isinstance(note, str) or not note.strip() or len(note) > 8000 or not isinstance(due_at, str):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A timer note and timezone-aware due time are required.")
+                timer = self.server.app.service.timer_set(note, due_at)
+                self._json(HTTPStatus.CREATED, {"ok": True, "data": {"timer": timer}})
+                return
+            if parsed.path == "/api/timer/clear":
+                timer_id = payload.get("timer_id")
+                if not isinstance(timer_id, str):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A valid timer ID is required.")
+                self._json(HTTPStatus.OK, {"ok": True, "data": self.server.app.service.timer_clear(timer_id)})
+                return
+            if parsed.path == "/api/timer/snooze":
+                timer_id, due_at = payload.get("timer_id"), payload.get("due_at")
+                if not isinstance(timer_id, str) or not isinstance(due_at, str):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A valid timer ID and timezone-aware due time are required.")
+                timer = self.server.app.service.timer_snooze(timer_id, due_at)
+                self._json(HTTPStatus.OK, {"ok": True, "data": {"timer": timer}})
+                return
+            if parsed.path == "/api/team/create":
+                name, members = payload.get("name"), payload.get("members", [])
+                if not isinstance(name, str) or not name.strip() or not isinstance(members, list) or not all(isinstance(item, str) for item in members):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A team name and member list are required.")
+                self._json(HTTPStatus.CREATED, {"ok": True, "data": {"team": IAMService.team_create(name.strip(), members)}})
+                return
+            if parsed.path == "/api/team/member":
+                name, member = payload.get("name"), payload.get("member")
+                if not isinstance(name, str) or not isinstance(member, str):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A team name and member are required.")
+                team = IAMService.team_add_member(name, member) if payload.get("active", True) else IAMService.team_remove_member(name, member)
+                self._json(HTTPStatus.OK, {"ok": True, "data": {"team": team}})
+                return
+            if parsed.path == "/api/team/leader":
+                name, member = payload.get("name"), payload.get("member")
+                if not isinstance(name, str) or not isinstance(member, str):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A team name and leader are required.")
+                team = IAMService.team_set_leader(name, member, bool(payload.get("active", True)))
+                self._json(HTTPStatus.OK, {"ok": True, "data": {"team": team}})
+                return
+            if parsed.path == "/api/team/grant":
+                name, leader, capability = payload.get("name"), payload.get("leader"), payload.get("capability")
+                if not all(isinstance(item, str) for item in (name, leader, capability)):
+                    raise WebError("IAM_WEB_REQUEST_INVALID", "A team name, leader, and capability are required.")
+                team = IAMService.team_grant(name, leader, capability)
+                self._json(HTTPStatus.OK, {"ok": True, "data": {"team": team}})
                 return
         except WebError as exc:
             if exc.code == "IAM_WEB_LOGIN_THROTTLED":
@@ -686,7 +742,9 @@ INDEX_HTML = r'''<!doctype html>
       <div id="network-warning" class="warning" hidden></div>
       <div class="workspace">
         <aside>
-          <button class="compose active" data-view="compose">New request</button>
+            <button class="compose active" data-view="compose">New request</button>
+          <button class="quiet" data-view="timers">Timers</button>
+          <button class="quiet" data-view="teams">Teams</button>
           <nav>
             <button data-folder="inbox">Inbox <span id="unread-count"></span></button>
             <button data-folder="sent">Sent</button>
@@ -705,6 +763,8 @@ INDEX_HTML = r'''<!doctype html>
             <input id="subject" maxlength="300" required>
             <label for="body">Request</label>
             <textarea id="body" rows="12" maxlength="100000" required></textarea>
+            <label for="priority">Priority</label>
+            <select id="priority"><option value="normal">Normal ? deliver when the agent is idle</option><option value="urgent">Urgent ? notify an active agent at a safe stopping point</option></select>
             <div class="form-actions"><button type="submit">Send request</button><span id="send-status" role="status"></span></div>
           </form>
         </section>
@@ -715,6 +775,16 @@ INDEX_HTML = r'''<!doctype html>
             <div id="messages"></div>
           </div>
           <article id="reader" class="reader"><div class="empty-state">Select a message to read it.</div></article>
+        </section>
+        <section id="timer-view" class="panel" hidden>
+          <p class="eyebrow">Temporary reminders</p><h2>Your timers</h2>
+          <form id="timer-form"><label for="timer-note">Reminder</label><textarea id="timer-note" rows="4" maxlength="8000" required></textarea><label for="timer-due">Due time</label><input id="timer-due" type="datetime-local" required><div class="form-actions"><button type="submit">Set timer</button><span id="timer-status" role="status"></span></div></form>
+          <div id="timers" class="reader-body" style="margin-top:28px"></div>
+        </section>
+        <section id="team-view" class="panel" hidden>
+          <p class="eyebrow">Human-managed coordination</p><h2>Teams</h2>
+          <form id="team-form"><label for="team-name">Team name</label><input id="team-name" maxlength="120" required><label for="team-members">Members</label><select id="team-members" multiple></select><div class="form-actions"><button type="submit">Create team</button><span id="team-status" role="status"></span></div></form>
+          <div id="teams" class="reader-body" style="margin-top:28px"></div>
         </section>
       </div>
     </section>
@@ -752,14 +822,20 @@ const $=id=>document.getElementById(id);
 async function api(path,options={}){options.credentials="same-origin";options.headers={"Content-Type":"application/json",...(csrf?{"X-IAM-CSRF":csrf}:{}),...(options.headers||{})};const response=await fetch(path,options);const data=await response.json();if(!response.ok)throw new Error(data.error?.message||"Request failed");return data.data||data}
 function showLogin(message=""){$("login").hidden=false;$("app").hidden=true;$("login-error").textContent=message}
 async function boot(){try{const data=await api("/api/session");csrf=data.csrf;$("login").hidden=true;$("app").hidden=false;$("identity").textContent=`${data.mailbox.display_name} <${data.mailbox.address}>`;$("network-mode").textContent=data.lan_enabled?"LAN access":"This PC only";if(data.network_warning){$("network-warning").hidden=false;$("network-warning").textContent=data.network_warning}await loadMailboxes();showCompose();if(!poll)poll=setInterval(()=>{if(folder==="inbox"&&!$("mail-view").hidden)loadMessages(false)},10000)}catch(error){showLogin()}}
-async function loadMailboxes(){const data=await api("/api/mailboxes");const select=$("to");select.replaceChildren();for(const box of data.mailboxes){const option=document.createElement("option");option.value=box.address;option.textContent=`${box.display_name} <${box.address}>`;select.append(option)}}
-function showCompose(){selected=null;$("compose-view").hidden=false;$("mail-view").hidden=true;document.querySelectorAll("[data-folder]").forEach(button=>button.classList.remove("active"))}
-async function openFolder(name){folder=name;selected=null;$("compose-view").hidden=true;$("mail-view").hidden=false;$("folder-name").textContent=name[0].toUpperCase()+name.slice(1);document.querySelectorAll("[data-folder]").forEach(button=>button.classList.toggle("active",button.dataset.folder===name));await loadMessages()}
-async function loadMessages(reset=true){try{const data=await api(`/api/messages?folder=${encodeURIComponent(folder)}&limit=200`);const container=$("messages");container.replaceChildren();let unread=0;for(const message of data.messages){if(!message.read_at&&folder==="inbox")unread++;const button=document.createElement("button");button.className=`message-row${!message.read_at&&folder==="inbox"?" unread":""}`;const sender=document.createElement("strong");sender.textContent=folder==="sent"?`To: ${(message.to_display||message.to||[]).join(", ")}`:(message.from_display||message.from);const subject=document.createElement("span");subject.textContent=message.subject;const date=document.createElement("span");date.textContent=new Date(message.created_at).toLocaleString();button.append(sender,subject,date);button.onclick=()=>readMessage(message,button);container.append(button)}$("unread-count").textContent=unread?`(${unread})`:"";if(reset||!selected)$("reader").replaceChildren(Object.assign(document.createElement("div"),{className:"empty-state",textContent:data.messages.length?"Select a message to read it.":"No messages here."}))}catch(error){$("messages").textContent=error.message}}
-async function readMessage(message,button){selected=message;document.querySelectorAll(".message-row").forEach(row=>row.classList.remove("active"));button.classList.add("active");if(folder==="inbox"&&!message.read_at){try{const data=await api("/api/read",{method:"POST",body:JSON.stringify({message_id:message.id})});message=data.message;button.classList.remove("unread")}catch(error){console.error(error)}}const reader=$("reader");reader.replaceChildren();const title=document.createElement("h2");title.textContent=message.subject;const meta=document.createElement("div");meta.className="reader-meta";meta.textContent=`From ${message.from_display||message.from} <${message.from}> · ${new Date(message.created_at).toLocaleString()}`;const body=document.createElement("div");body.className="reader-body";body.textContent=message.body;reader.append(title,meta,body);if(folder==="inbox"){const reply=document.createElement("textarea");reply.className="reply-box";reply.rows=6;reply.placeholder="Write a reply…";const actions=document.createElement("div");actions.className="reader-actions";const send=document.createElement("button");send.textContent="Send reply";send.onclick=async()=>{if(!reply.value.trim())return;try{await api("/api/reply",{method:"POST",body:JSON.stringify({message_id:message.id,body:reply.value})});reply.value="";send.textContent="Reply sent"}catch(error){send.textContent=error.message}};const archive=document.createElement("button");archive.className="quiet";archive.textContent="Archive";archive.onclick=async()=>{try{await api("/api/archive",{method:"POST",body:JSON.stringify({message_id:message.id})});await loadMessages()}catch(error){archive.textContent=error.message}};actions.append(send,archive);reader.append(reply,actions)}}
+async function loadMailboxes(){const data=await api("/api/mailboxes");for(const id of ["to","team-members"]){const select=$(id);select.replaceChildren();for(const box of data.mailboxes){const option=document.createElement("option");option.value=box.address;option.textContent=`${box.display_name} <${box.address}>`;select.append(option)}}}
+function hideViews(){["compose-view","mail-view","timer-view","team-view"].forEach(id=>$(id).hidden=true)}function showCompose(){selected=null;hideViews();$("compose-view").hidden=false;document.querySelectorAll("[data-folder]").forEach(button=>button.classList.remove("active"))}
+async function openFolder(name){folder=name;selected=null;hideViews();$("mail-view").hidden=false;$("folder-name").textContent=name[0].toUpperCase()+name.slice(1);document.querySelectorAll("[data-folder]").forEach(button=>button.classList.toggle("active",button.dataset.folder===name));await loadMessages()}
+async function showTimers(){hideViews();$("timer-view").hidden=false;const data=await api("/api/timers");const target=$("timers");target.replaceChildren();if(!data.timers.length){target.textContent="No outstanding timers.";return}for(const timer of data.timers){const row=document.createElement("div");row.style.marginBottom="14px";const text=document.createElement("div");text.textContent=`${new Date(timer.due_at).toLocaleString()} — ${timer.note}`;const clear=document.createElement("button");clear.className="quiet";clear.textContent="Clear";clear.style.marginTop="7px";clear.onclick=async()=>{await api("/api/timer/clear",{method:"POST",body:JSON.stringify({timer_id:timer.id})});showTimers()};row.append(text,clear);target.append(row)}}
+async function showTeams(){hideViews();$("team-view").hidden=false;const data=await api("/api/teams");const target=$("teams");target.replaceChildren();target.textContent=data.teams.length?data.teams.map(team=>`${team.name}: ${team.members.length} member(s), ${team.leaders.length} active leader(s)`).join("\n"):"No teams."}
+async function loadMessages(reset=true){try{const data=await api(`/api/messages?folder=${encodeURIComponent(folder)}&limit=200`);const container=$("messages");container.replaceChildren();let unread=0;for(const message of data.messages){if(!message.read_at&&folder==="inbox")unread++;const button=document.createElement("button");button.className=`message-row${!message.read_at&&folder==="inbox"?" unread":""}`;const sender=document.createElement("strong");sender.textContent=folder==="sent"?`To: ${(message.to_display||message.to||[]).join(", ")}`:(message.from_display||message.from);const subject=document.createElement("span");subject.textContent=`${message.priority==="urgent"?"URGENT ? ":""}${message.subject}`;const date=document.createElement("span");date.textContent=new Date(message.created_at).toLocaleString();button.append(sender,subject,date);button.onclick=()=>readMessage(message,button);container.append(button)}$("unread-count").textContent=unread?`(${unread})`:"";if(reset||!selected)$("reader").replaceChildren(Object.assign(document.createElement("div"),{className:"empty-state",textContent:data.messages.length?"Select a message to read it.":"No messages here."}))}catch(error){$("messages").textContent=error.message}}
+async function readMessage(message,button){selected=message;document.querySelectorAll(".message-row").forEach(row=>row.classList.remove("active"));button.classList.add("active");if(folder==="inbox"&&!message.read_at){try{const data=await api("/api/read",{method:"POST",body:JSON.stringify({message_id:message.id})});message=data.message;button.classList.remove("unread")}catch(error){console.error(error)}}const reader=$("reader");reader.replaceChildren();const title=document.createElement("h2");title.textContent=`${message.priority==="urgent"?"URGENT ? ":""}${message.subject}`;const meta=document.createElement("div");meta.className="reader-meta";meta.textContent=`From ${message.from_display||message.from} <${message.from}> · ${new Date(message.created_at).toLocaleString()}`;const body=document.createElement("div");body.className="reader-body";body.textContent=message.body;reader.append(title,meta,body);if(folder==="inbox"){const reply=document.createElement("textarea");reply.className="reply-box";reply.rows=6;reply.placeholder="Write a reply…";const actions=document.createElement("div");actions.className="reader-actions";const send=document.createElement("button");send.textContent="Send reply";send.onclick=async()=>{if(!reply.value.trim())return;try{await api("/api/reply",{method:"POST",body:JSON.stringify({message_id:message.id,body:reply.value})});reply.value="";send.textContent="Reply sent"}catch(error){send.textContent=error.message}};const archive=document.createElement("button");archive.className="quiet";archive.textContent="Archive";archive.onclick=async()=>{try{await api("/api/archive",{method:"POST",body:JSON.stringify({message_id:message.id})});await loadMessages()}catch(error){archive.textContent=error.message}};actions.append(send,archive);reader.append(reply,actions)}}
 $("login-form").onsubmit=async event=>{event.preventDefault();try{const data=await api("/api/login",{method:"POST",body:JSON.stringify({password:$("password").value})});csrf=data.csrf;$("password").value="";await boot()}catch(error){showLogin(error.message)}};
-$("compose-form").onsubmit=async event=>{event.preventDefault();const to=[...$("to").selectedOptions].map(option=>option.value);try{await api("/api/send",{method:"POST",body:JSON.stringify({to,subject:$("subject").value,body:$("body").value})});$("compose-form").reset();$("send-status").textContent="Request sent."}catch(error){$("send-status").textContent=error.message}};
+$("compose-form").onsubmit=async event=>{event.preventDefault();const to=[...$("to").selectedOptions].map(option=>option.value);try{await api("/api/send",{method:"POST",body:JSON.stringify({to,subject:$("subject").value,body:$("body").value,priority:$("priority").value})});$("compose-form").reset();$("send-status").textContent="Request sent."}catch(error){$("send-status").textContent=error.message}};
+$("timer-form").onsubmit=async event=>{event.preventDefault();try{const due=new Date($("timer-due").value).toISOString();await api("/api/timer/set",{method:"POST",body:JSON.stringify({note:$("timer-note").value,due_at:due})});$("timer-form").reset();$("timer-status").textContent="Timer set.";showTimers()}catch(error){$("timer-status").textContent=error.message}};
+$("team-form").onsubmit=async event=>{event.preventDefault();try{const members=[...$("team-members").selectedOptions].map(option=>option.value);await api("/api/team/create",{method:"POST",body:JSON.stringify({name:$("team-name").value,members})});$("team-form").reset();$("team-status").textContent="Team created.";showTeams()}catch(error){$("team-status").textContent=error.message}};
 document.querySelector("[data-view=compose]").onclick=showCompose;
+document.querySelector("[data-view=timers]").onclick=showTimers;
+document.querySelector("[data-view=teams]").onclick=showTeams;
 document.querySelectorAll("[data-folder]").forEach(button=>button.onclick=()=>openFolder(button.dataset.folder));
 $("refresh").onclick=()=>loadMessages();
 $("logout").onclick=async()=>{try{await api("/api/logout",{method:"POST",body:"{}"})}finally{csrf="";if(poll){clearInterval(poll);poll=null}showLogin()}};

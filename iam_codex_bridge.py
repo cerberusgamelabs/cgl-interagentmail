@@ -24,6 +24,14 @@ from iam_service import IAMService
 LOG = logging.getLogger("iam.codex_bridge")
 
 
+def timer_delivery_prompt(timer: dict[str, Any]) -> str:
+    return (
+        f"[timer] Reminder {timer['id']}: {timer['note']}\n\n"
+        "This is a temporary IAM timer. Use iam_timer_clear after accepting or completing it, "
+        "or iam_timer_snooze to move it. Do not archive it as mail."
+    )
+
+
 class AppServerError(RuntimeError):
     """The Codex app-server connection or request failed."""
 
@@ -58,7 +66,17 @@ class AppServerClient:
             LOG.info("Connecting to Codex app-server at %s", self.url)
             headers = {"Authorization": f"Bearer {self.bearer_token}"} if self.bearer_token else None
             try:
-                self.websocket = await websocket_connect(self.url, additional_headers=headers)
+                # A resumed Codex thread can include a substantial transcript.  The
+                # websockets library defaults to a 1 MiB incoming-frame limit, which
+                # causes an otherwise healthy app-server connection to be closed
+                # before IAM can bind the mailbox.  Leave message sizing to the
+                # local app-server/client process rather than silently discarding
+                # a valid project thread.
+                self.websocket = await websocket_connect(
+                    self.url,
+                    additional_headers=headers,
+                    max_size=None,
+                )
             except (OSError, WebSocketException) as exc:
                 raise AppServerError(f"Could not connect to app-server WebSocket: {exc}") from exc
             self.reader_task = asyncio.create_task(self._read_websocket())
@@ -281,11 +299,31 @@ class DeliveryState:
         })
 
 
-def delivery_prompt(messages: list[dict[str, Any]]) -> str:
+def delivery_prompt(messages: list[dict[str, Any]], *, urgent: bool = False) -> str:
     rows = []
     for message in messages:
         sender = message.get("from_display") or message.get("from") or "unknown"
-        rows.append(f"- {message['id']} from {sender}: {message.get('subject', '(no subject)')}")
+        label = " [URGENT]" if message.get("priority", "normal") == "urgent" else ""
+        delegation = message.get("metadata", {}).get("webconnect", {})
+        delegated = " [DELEGATED: owner approval required for changes]" if delegation.get("approval_required") else ""
+        rows.append(f"- {message['id']}{label}{delegated} from {sender}: {message.get('subject', '(no subject)')}")
+    delegated_instruction = (
+        " Delegated WebConnect mail may be discussed and answered normally, but before making project changes, "
+        "running consequential commands, changing configuration, deploying, publishing, deleting, or sending external messages, "
+        "contact the recorded node-owner mailbox for approval in the same IAM thread."
+        if any(message.get("metadata", {}).get("webconnect", {}).get("approval_required") for message in messages)
+        else ""
+    )
+    if urgent:
+        return (
+            "InterAgentMail received urgent mail during your current work:\n\n"
+            + "\n".join(rows)
+            + "\n\nFinish any atomic in-flight action safely, then use the InterAgentMail MCP tools "
+            "to read and handle each urgent message. Apply relevant context, then continue the "
+            "task already in progress. Do not send acknowledgment-only replies. If the MCP tools "
+            "are unavailable, use the InterAgentMail skill/CLI."
+            + delegated_instruction
+        )
     return (
         "InterAgentMail received new mail for this project:\n\n"
         + "\n".join(rows)
@@ -294,6 +332,21 @@ def delivery_prompt(messages: list[dict[str, Any]]) -> str:
         "is fully handled. Do not send receipt, thanks, or acknowledgment-only replies; reply only "
         "when the sender requested a response or you have a substantive result or question. If the "
         "MCP tools are unavailable, use the InterAgentMail skill/CLI."
+        + delegated_instruction
+    )
+
+
+def chat_delivery_prompt(channel: str, entries: list[dict[str, Any]]) -> str:
+    rows = []
+    for entry in entries:
+        sender = entry.get("agent") or entry.get("address") or "unknown"
+        system = " [system]" if entry.get("type") == "system" else ""
+        rows.append(f"[{channel}]{system} {sender}: {entry.get('message', '')} (entry {entry['id']})")
+    return (
+        "InterAgentMail received new chat activity:\n\n"
+        + "\n".join(rows)
+        + "\n\nUse iam_chat_tail for the authoritative recent context, then respond with iam_chat_post "
+        "only if appropriate. System entries are informational, not work requests."
     )
 
 
@@ -363,17 +416,18 @@ class MailboxBridge:
                     )
                     return thread
                 except AppServerError as resume_error:
-                    if not self.create_thread:
-                        raise resume_error from read_error
+                    # A caller that supplied a thread ID chose that specific
+                    # conversation.  Preserve the pin on any failure rather
+                    # than silently clearing it and starting a new thread.
                     LOG.warning(
-                        "Codex thread %s for %s is unavailable; creating a replacement",
+                        "Pinned Codex thread %s for %s is unavailable; preserving the mailbox thread binding",
                         self.explicit_thread_id,
                         self.service.address,
                     )
-                    self.explicit_thread_id = None
-                    self.state.thread_id = None
-                    self.state.save()
-                    return await self._start_thread()
+                    raise AppServerError(
+                        f"Pinned Codex thread {self.explicit_thread_id} for {self.service.address} is unavailable. "
+                        "Its IAM binding was preserved; explicitly choose a replacement thread before changing it."
+                    ) from resume_error
 
         result = await self.client.request(
             "thread/list",
@@ -413,8 +467,16 @@ class MailboxBridge:
                 self._remember_thread(str(thread["id"]))
                 LOG.info("Attached mailbox %s to saved Codex thread %s", self.service.address, preferred)
                 return thread
-            except AppServerError:
-                LOG.warning("Saved Codex thread %s is unavailable; selecting another", preferred)
+            except AppServerError as exc:
+                LOG.warning(
+                    "Saved Codex thread %s for %s is unavailable; preserving the mailbox thread binding",
+                    preferred,
+                    self.service.address,
+                )
+                raise AppServerError(
+                    f"Pinned Codex thread {preferred} for {self.service.address} is unavailable. "
+                    "Its IAM binding was preserved; explicitly choose a replacement thread before changing it."
+                ) from exc
 
         if candidates:
             candidate = candidates[0]
@@ -502,8 +564,35 @@ class MailboxBridge:
         result = await self.client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
         status = result["thread"].get("status") or {"type": "notLoaded"}
         if status.get("type") == "active":
-            LOG.debug("Codex thread %s is active; %d mail message(s) remain queued", thread_id, len(pending))
-            return False
+            urgent = [message for message in pending if message.get("priority", "normal") == "urgent"]
+            active_flags = set(status.get("activeFlags") or [])
+            if not urgent or "waitingOnApproval" in active_flags:
+                LOG.debug("Codex thread %s is active; %d mail message(s) remain queued", thread_id, len(pending))
+                return False
+            active_detail = await self.client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": True}
+            )
+            active_turn = next(
+                (turn for turn in reversed(active_detail["thread"].get("turns") or [])
+                 if str(turn.get("status", "")).replace("_", "").lower() in {"inprogress", "active"}),
+                None,
+            )
+            if not active_turn or not active_turn.get("id"):
+                LOG.warning("Codex thread %s is active without an identifiable turn; urgent mail remains queued", thread_id)
+                return False
+            batch = urgent[: self.batch_size]
+            message_ids = [str(message["id"]) for message in batch]
+            await self.client.request(
+                "turn/steer",
+                {
+                    "threadId": thread_id,
+                    "expectedTurnId": str(active_turn["id"]),
+                    "input": [{"type": "text", "text": delivery_prompt(batch, urgent=True)}],
+                },
+            )
+            self.state.mark_delivered(message_ids)
+            LOG.info("Steered %d urgent IAM message(s) into active Codex thread %s", len(batch), thread_id)
+            return True
         if status.get("type") == "notLoaded":
             await self.client.request("thread/resume", {"threadId": thread_id})
         elif status.get("type") != "idle":
@@ -528,6 +617,72 @@ class MailboxBridge:
         )
         self.state.mark_delivered(message_ids)
         LOG.info("Delivered %d IAM message(s) to Codex thread %s", len(batch), thread_id)
+        return True
+
+    async def deliver_chat(self, channel: str, entries: list[dict[str, Any]]) -> bool:
+        """Deliver live channel activity, steering active turns and starting idle ones."""
+        if not entries:
+            return False
+        thread_id = self.state.thread_id
+        if not thread_id:
+            raise AppServerError("No Codex thread is attached")
+        result = await self.client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+        status = result["thread"].get("status") or {"type": "notLoaded"}
+        prompt = chat_delivery_prompt(channel, entries)
+        if status.get("type") == "active":
+            active_detail = await self.client.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+            active_turn = next(
+                (turn for turn in reversed(active_detail["thread"].get("turns") or [])
+                 if str(turn.get("status", "")).replace("_", "").lower() in {"inprogress", "active"}),
+                None,
+            )
+            if not active_turn or not active_turn.get("id"):
+                return False
+            await self.client.request("turn/steer", {
+                "threadId": thread_id,
+                "expectedTurnId": str(active_turn["id"]),
+                "input": [{"type": "text", "text": prompt}],
+            })
+            return True
+        if status.get("type") == "notLoaded":
+            await self.client.request("thread/resume", {"threadId": thread_id})
+        elif status.get("type") != "idle":
+            return False
+        digest = hashlib.sha256("\n".join(str(entry["id"]) for entry in entries).encode("utf-8")).hexdigest()[:24]
+        await self.client.request("turn/start", {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "clientUserMessageId": f"iam-chat-{digest}",
+            "approvalPolicy": self.approval_policy,
+            "sandboxPolicy": turn_sandbox_policy(self.sandbox, self.service.project_root),
+        })
+        return True
+
+    async def deliver_timer(self, timer: dict[str, Any]) -> bool:
+        """Deliver one due timer once, steering an active turn when possible."""
+        thread_id = self.state.thread_id
+        if not thread_id:
+            raise AppServerError("No Codex thread is attached")
+        result = await self.client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+        status = result["thread"].get("status") or {"type": "notLoaded"}
+        prompt = timer_delivery_prompt(timer)
+        if status.get("type") == "active":
+            detail = await self.client.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+            active_turn = next((turn for turn in reversed(detail["thread"].get("turns") or [])
+                if str(turn.get("status", "")).replace("_", "").lower() in {"inprogress", "active"}), None)
+            if not active_turn or not active_turn.get("id"):
+                return False
+            await self.client.request("turn/steer", {"threadId": thread_id, "expectedTurnId": str(active_turn["id"]), "input": [{"type": "text", "text": prompt}]})
+            return True
+        if status.get("type") == "notLoaded":
+            await self.client.request("thread/resume", {"threadId": thread_id})
+        elif status.get("type") != "idle":
+            return False
+        await self.client.request("turn/start", {
+            "threadId": thread_id, "input": [{"type": "text", "text": prompt}],
+            "clientUserMessageId": f"iam-timer-{timer['id']}", "approvalPolicy": self.approval_policy,
+            "sandboxPolicy": turn_sandbox_policy(self.sandbox, self.service.project_root),
+        })
         return True
 
     async def run(self, poll_seconds: float) -> None:
