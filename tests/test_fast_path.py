@@ -26,7 +26,10 @@ class FastPathTests(unittest.IsolatedAsyncioTestCase):
         iam.write_atomic(iam.CONFIG, {"projects": {"Alpha": {
             "project_root": str(iam.ROOT), "sandbox": "read-only", "approval_policy": "on-request"}}})
         iam.write_atomic(iam.mailbox("Alpha") / ".codex-bridge-state.json", {"thread_id": "exact"})
-        fp.directory().mkdir(parents=True)
+        # Match real registration: a private directory, not the runner's
+        # default inherited/admin-owned directory ACL.
+        from iam_hooks import private_directory
+        private_directory(fp.directory())
         self.cfg = dict(version=1, enabled=True, steeringEnabled=False,
                         integrationId="integration", registrationGeneration="generation", residentId="Resident",
                         mailbox="Alpha", owner="Alpha", root=str(iam.ROOT), threadBinding="exact",

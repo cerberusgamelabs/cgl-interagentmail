@@ -7,7 +7,7 @@
 - Added consent-scoped friendships and invitations, separate participant history, original file transfer, and read-through behavior. Friend contact does not grant owner authority.
 - Added heartbeat scheduling, hooks, shared-session routing, and fast-path delivery with explicit recovery and review boundaries.
 - Improved connector validation, reconnect handling, delivery diagnostics, and module packaging.
-- Fixed Windows permission checks when launched from shells with incompatible PowerShell module paths, while retaining strict private-directory access checks.
+- Fixed private-directory initialization on Windows, including elevated accounts and Python 3.13. Permission checks use numeric Windows identities without PowerShell module dependencies; unsafe existing directories remain rejected.
 - Credited Rowan as AI development collaborator for Messenger and supporting coordination systems, under human project direction and review.
 
 The Python package includes Desktop Messenger source and assets; its optional

@@ -68,37 +68,96 @@ def utc(value):
     return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _windows_directory_principals(path):
+    """Read numeric owner/DACL SIDs, without shell-specific SDDL aliases."""
+    import ctypes
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.c_void_p
+    out_pointer = ctypes.POINTER(pointer)
+    api.GetNamedSecurityInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+        wintypes.DWORD, out_pointer, out_pointer, out_pointer, out_pointer, out_pointer]
+    api.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    api.GetAce.argtypes = [pointer, wintypes.DWORD, out_pointer]
+    api.GetAce.restype = wintypes.BOOL
+    api.ConvertSidToStringSidW.argtypes = [pointer, ctypes.POINTER(wintypes.LPWSTR)]
+    api.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [pointer]
+    kernel.LocalFree.restype = pointer
+
+    def sid_string(value):
+        require(bool(value), "invalid_state_directory_sid", 403)
+        result = wintypes.LPWSTR()
+        if not api.ConvertSidToStringSidW(value, ctypes.byref(result)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return result.value
+        finally:
+            kernel.LocalFree(ctypes.cast(result, pointer))
+
+    owner, acl, descriptor = pointer(), pointer(), pointer()
+    # SE_FILE_OBJECT; OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION.
+    error = api.GetNamedSecurityInfoW(str(path), 1, 5, ctypes.byref(owner), None,
+                                    ctypes.byref(acl), None, ctypes.byref(descriptor))
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        require(bool(acl.value), "state_directory_has_other_principals", 403)
+        # ACL header: BYTE revision/reserved, WORD size/count/reserved.
+        count = ctypes.c_ushort.from_address(acl.value + 4).value
+        principals = []
+        for index in range(count):
+            ace = pointer()
+            if not api.GetAce(acl, index, ctypes.byref(ace)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            # Simple allow/deny ACEs have a four-byte header, DWORD mask, SID.
+            # Unknown/object/callback ACE layouts fail closed rather than guess.
+            kind = ctypes.c_ubyte.from_address(ace.value).value
+            size = ctypes.c_ushort.from_address(ace.value + 2).value
+            require(kind in (0, 1) and size >= 16, "unsupported_state_directory_ace", 403)
+            principals.append(sid_string(ace.value + 8))
+        return sid_string(owner), principals
+    finally:
+        kernel.LocalFree(descriptor)
+
+
 def private_directory(path):
     """Apply ACLs only to this dedicated directory, never the workspace root."""
     path = Path(path).absolute()
     require(not path.is_symlink() and (not path.exists() or not
             (getattr(path.lstat(), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)),
             "unsafe_state_directory")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=False)
+        created = True
+    except FileExistsError:
+        created = False
+        require(path.is_dir(), "unsafe_state_directory")
+    require(not (getattr(path.lstat(), "st_file_attributes", 0)
+                 & stat.FILE_ATTRIBUTE_REPARSE_POINT), "unsafe_state_directory")
     if os.name == "nt":
         output = subprocess.check_output(["whoami", "/user", "/fo", "csv", "/nh"], text=True,
                                          creationflags=subprocess.CREATE_NO_WINDOW)
         sid = next(csv.reader([output.strip()]))[1]
         require(bool(re.fullmatch(r"S-1-[0-9-]+", sid)), "cannot_identify_owner")
+        if created:
+            # Only our newly created, still-empty directory can be initialized.
+            # Windows/Python may add explicit Administrators/Owner Rights ACEs.
+            # Never reset an existing directory's explicit grants or ownership.
+            subprocess.run(["icacls", str(path), "/setowner", f"*{sid}"],
+                           check=True, stdout=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+            subprocess.run(["icacls", str(path), "/reset"],
+                           check=True, stdout=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
         subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r",
                         f"*{sid}:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"],
                        check=True, stdout=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
         # /grant:r does not remove pre-existing explicit grants to other users.
         # Refuse such a directory rather than silently claiming it is private.
-        env = dict(os.environ, IAM_HOOK_ACL_PATH=str(path))
-        sddl = subprocess.check_output([
-            "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            # A caller running PowerShell 7 can export its incompatible module
-            # paths to Windows PowerShell 5.1. Load the executing host's own
-            # security module explicitly; keep ACL failures fail-closed.
-            "$ErrorActionPreference = 'Stop'; "
-            "Import-Module (Join-Path $PSHOME "
-            "'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') "
-            "-ErrorAction Stop; "
-            "(Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:IAM_HOOK_ACL_PATH).Sddl",
-        ], text=True, env=env, creationflags=subprocess.CREATE_NO_WINDOW).strip()
-        aces = re.findall(r"\(([^()]*)\)", sddl)
-        require(aces and all(ace.split(";")[-1] in (sid, "SY", "S-1-5-18") for ace in aces),
+        owner, principals = _windows_directory_principals(path)
+        require(owner in (sid, "S-1-5-18") and principals
+                and all(principal in (sid, "S-1-5-18") for principal in principals),
                 "state_directory_has_other_principals", 403)
     else:
         os.chmod(path, 0o700)
