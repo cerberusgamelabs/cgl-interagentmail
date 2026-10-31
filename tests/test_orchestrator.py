@@ -241,6 +241,7 @@ class OrchestratorSetupTests(unittest.TestCase):
         state.save()
         args = argparse.Namespace(project=str(self.project), url=MANAGED_ENDPOINT, thread_id="chosen-thread")
         with (
+            patch("iam_orchestrator.codex_executable", return_value="codex-test"),
             patch("iam_orchestrator.ensure_appserver"),
             patch("iam_orchestrator.ensure_daemon"),
             patch("iam_orchestrator.thread_available", new_callable=AsyncMock, return_value=True),
@@ -248,12 +249,13 @@ class OrchestratorSetupTests(unittest.TestCase):
                 "iam_orchestrator.apply_thread_policy",
                 new_callable=AsyncMock,
                 side_effect=IAMError("policy rejected"),
-            ),
+            ) as apply_policy,
             patch("iam_orchestrator.subprocess.run") as run,
         ):
             with self.assertRaisesRegex(IAMError, "policy rejected"):
                 cmd_open(args)
 
+        apply_policy.assert_awaited_once()
         run.assert_not_called()
         self.assertEqual(
             "old-thread",
