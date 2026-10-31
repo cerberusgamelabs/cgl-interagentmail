@@ -1,0 +1,22 @@
+:root{font:14px 'Segoe UI',sans-serif;color-scheme:dark;color:#e5e6ef;background:#171923}*{box-sizing:border-box}body{padding:18px;margin:0}h1{font-size:19px;margin:0 0 10px}p{line-height:1.5;overflow-wrap:anywhere}#scope{font-size:12px;opacity:.8}main{display:flex;flex-direction:column;gap:12px}button,select{font:inherit;padding:9px;border:1px solid #626982;border-radius:8px;background:#262a3a;color:inherit}button{cursor:pointer}button:disabled{opacity:.5;cursor:default}label{display:flex;flex-direction:column;gap:6px}pre{font:12px Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:#232736;padding:12px;border-radius:8px}footer{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.danger{border-color:#d88d7f}#notice{font-size:12px;color:#edbf78}:focus-visible{outline:2px solid #b398ef;outline-offset:2px}:root[data-theme="light"]{color-scheme:light;color:#26314c;background:#eef0f7}:root[data-theme="light"] button,:root[data-theme="light"] select,:root[data-theme="light"] pre{background:white;color:#26314c}:root[data-theme="light"] #notice{color:#874315}
+input{font:inherit;width:100%;min-width:0;padding:9px;border:1px solid #626982;border-radius:8px;background:#262a3a;color:inherit}
+:root{--status-panel:#232736;--status-muted:#b2b8ce;--status-border:#3c4259;--status-track:#12151f;--status-accent:#b39add}
+.status-card{background:var(--status-panel);border:1px solid var(--status-border);border-radius:14px;padding:16px}
+.status-hero{display:flex;gap:12px;align-items:center;margin-bottom:18px}
+.status-monogram{display:grid;place-items:center;width:42px;height:42px;border-radius:12px;background:#edbf78;color:#343c68;font:bold 24px Georgia;flex-shrink:0}
+.status-hero h2,.status-usage h2{font-size:17px;margin:0}
+.status-caption{font-size:11px;color:var(--status-muted);margin:4px 0 0}
+.status-pill{margin-left:auto;padding:4px 9px;border-radius:20px;background:#465078;font-size:11px;color:#fff}
+.status-fields{display:grid;grid-template-columns:105px minmax(0,1fr);gap:10px 16px;margin:0;font-size:12px;line-height:1.5}
+.status-fields dt{color:var(--status-muted)}.status-fields dd{margin:0;overflow-wrap:anywhere;white-space:pre-wrap;user-select:text}
+.status-mono{font:11px/1.6 Consolas,monospace}
+.status-meter{margin-top:16px}.status-meter-label{display:flex;justify-content:space-between;gap:8px;font-size:12px}
+.status-meter progress{appearance:none;width:100%;height:8px;border:0;border-radius:6px;overflow:hidden;margin-top:8px}
+.status-meter progress::-webkit-progress-bar{background:var(--status-track)}.status-meter progress::-webkit-progress-value{background:var(--status-accent);border-radius:6px}
+.status-meter small{display:block;margin-top:5px;color:var(--status-muted);font-size:10px}
+.status-credits{margin:16px 0 0;font-size:12px}.status-footnote{font-size:10px;color:var(--status-muted);margin:0}
+.status-compacting{color:#edbf78}.status-content{gap:12px}
+:root[data-theme="light"]{--status-panel:#fff;--status-muted:#636c82;--status-border:#d6d9e5;--status-track:#e8e9f1;--status-accent:#71629b}
+@media(max-width:420px){.status-fields{grid-template-columns:85px minmax(0,1fr);gap:9px}.status-card{padding:12px}}
+main>img{max-width:100%;height:auto;align-self:center}main>textarea{width:100%;min-height:90px;resize:vertical;overflow-wrap:anywhere;font:12px Consolas,monospace}label:has(input[type=checkbox]){flex-direction:row;align-items:center}input[type=checkbox]{width:18px;height:18px;flex-shrink:0}
+.pairing-choices{max-height:220px;overflow:auto;border:1px solid #626982;border-radius:8px;padding:8px}.pairing-choices label{padding:4px}

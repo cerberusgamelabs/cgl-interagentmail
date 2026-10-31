@@ -1,0 +1,16 @@
+{
+  "name": "iam-messenger-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "node build.mjs",
+    "sync": "npm.cmd run build && cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/core": "8.5.3",
+    "@capacitor/android": "8.5.3"
+  },
+  "devDependencies": {"@capacitor/cli": "8.5.3"}
+}

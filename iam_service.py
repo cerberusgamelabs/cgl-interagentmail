@@ -21,6 +21,62 @@ class IAMError(ValueError):
     """A user-facing IAM operation error."""
 
 
+def session_owner(address: str, config: dict[str, Any] | None = None) -> str:
+    """Resolve an explicit, one-level local mailbox link; fail closed on bad links."""
+    config = config if config is not None else (iam.load(iam.CONFIG) if iam.CONFIG.exists() else {})
+    if not isinstance(config, dict):
+        raise IAMError("Invalid shared-session configuration")
+    links = config.get("session_mailboxes", {})
+    projects = config.get("projects", {})
+    if not isinstance(links, dict) or not isinstance(projects, dict):
+        raise IAMError("Invalid shared-session configuration")
+    owner = links.get(address, address)
+    if not isinstance(owner, str):
+        raise IAMError("Invalid shared-session owner")
+    if address in links:
+        if owner == address or owner in links or address not in projects or owner not in projects:
+            raise IAMError("Shared-session links require registered projects and cannot form chains or cycles")
+    return owner
+
+
+def mailbox_service(project_root: str | Path, mailbox: str | None = None) -> "IAMService":
+    """Select only identities explicitly linked to this exact registered project."""
+    bound = IAMService(project_root)
+    if mailbox is None or mailbox == bound.address:
+        return bound
+    config = iam.load(iam.CONFIG) if iam.CONFIG.exists() else {}
+    if not isinstance(config, dict):
+        raise IAMError("Invalid shared-session configuration")
+    projects = config.get("projects", {})
+    if not isinstance(projects, dict):
+        raise IAMError("Invalid shared-session configuration")
+    entry = projects.get(bound.address, {})
+    target = projects.get(mailbox, {})
+    if (not isinstance(entry, dict) or not isinstance(target, dict)
+            or not entry.get("project_root") or not target.get("project_root")
+            or Path(entry["project_root"]).resolve() != bound.project_root
+            or session_owner(bound.address, config) != session_owner(mailbox, config)):
+        raise IAMError("Mailbox is not authorized for this shared session")
+    selected = IAMService(target["project_root"])
+    if selected.address != mailbox:
+        raise IAMError("Mailbox registration does not match its project root")
+    return selected
+
+
+def session_workspace(owner: str) -> str:
+    """Read the last verified workspace, never infer it from incoming mail."""
+    path = iam.mailbox(owner) / ".session-workspace.json"
+    if not path.exists():
+        return owner
+    data = iam.load(path)
+    if not isinstance(data, dict) or data.get("verified") is not True:
+        raise IAMError(f"Workspace switch for {owner} is unverified; retry iam open before delivery")
+    address = data.get("mailbox")
+    if not isinstance(address, str) or session_owner(address) != owner:
+        raise IAMError(f"Active workspace for {owner} is no longer linked; open the primary to reset it")
+    return address
+
+
 @contextmanager
 def translated_errors() -> Iterator[None]:
     try:
@@ -64,6 +120,19 @@ class IAMService:
             data = iam.profile(self.address)
         return {**data, "project_root": str(self.project_root) if self.project_root else None}
 
+    def session_mailboxes(self) -> list[str]:
+        """Discover explicitly authorized identities without creating other mailboxes."""
+        if self.project_root is None:
+            return [self.address]
+        config = iam.load(iam.CONFIG) if iam.CONFIG.exists() else {}
+        owner = session_owner(self.address, config)
+        result = {self.address}
+        for name in config.get("projects", {}):
+            if session_owner(name, config) == owner:
+                mailbox_service(self.project_root, name)
+                result.add(name)
+        return sorted(result)
+
     def list_mailboxes(self) -> list[dict[str, str]]:
         result: list[dict[str, str]] = []
         if not iam.MAILBOXES.exists():
@@ -87,8 +156,8 @@ class IAMService:
             raise IAMError("limit must be between 1 and 1000")
         rows: list[dict[str, Any]] = []
         with translated_errors():
-            for path in reversed(iam.messages(self.address, folder)):
-                rows.append(iam.load(path))
+            for message in iam.readable_messages(self.address, folder):
+                rows.append(message)
                 if len(rows) >= limit:
                     break
         return rows
@@ -98,9 +167,7 @@ class IAMService:
             raise IAMError("limit must be between 1 and 1000")
         rows: list[dict[str, Any]] = []
         with translated_errors():
-            paths = reversed(iam.messages(self.address, "inbox"))
-            for path in paths:
-                message = iam.load(path)
+            for message in iam.readable_messages(self.address, "inbox"):
                 if unread_only and message.get("read_at"):
                     continue
                 rows.append(message)
@@ -135,6 +202,7 @@ class IAMService:
         originator: str | None = None,
         priority: str = "normal",
         metadata: dict[str, Any] | None = None,
+        delivery_key: str | None = None,
     ) -> dict[str, Any]:
         with translated_errors():
             return iam.send_message(
@@ -149,6 +217,7 @@ class IAMService:
                 refs=_as_list(references),
                 priority=priority,
                 metadata=metadata,
+                delivery_key=delivery_key,
             )
 
     def resolve_mail_recipients(self, values: list[str]) -> list[str]:

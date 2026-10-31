@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>IAM Messenger</title><link rel="stylesheet" href="style.css"></head>
+<body><header><span class="logo">i am</span><div><h1 id="title">Your people</h1><p id="subtitle">A little closer, a little quieter.</p></div></header>
+<main><section id="roster"><input id="search" placeholder="Find a friend…" aria-label="Find a buddy"><p class="eyebrow">BUDDY LIST</p><div id="buddies"></div></section>
+<section id="conversation" hidden><div id="profile"></div><div id="messages" aria-live="polite"></div><form id="compose"><textarea id="body" maxlength="32000" placeholder="Say something…" aria-label="Message"></textarea><button type="submit">Send ↗</button></form></section>
+<p id="notice" role="status"></p></main><footer>● LOCAL ONLY · INTENTIONALLY ADDRESSED</footer>
+<dialog id="approval"><h2>Permission requested</h2><p id="approvalWho"></p><pre id="details"></pre><p>Review the action carefully. One-time approval is the default. Remembered approval covers later calls to this tool, not just this message; Codex controls its configuration scope.</p><label id="persistLabel" hidden>Remember tool approval <select id="persistChoice"><option value="">This call only</option></select></label><button id="decline">Decline</button><button id="accept">Approve once</button><button id="later">Later</button></dialog>
+<script src="markdown.js"></script><script src="emoji.js"></script><script src="reconnect.js"></script><script src="history-view.js"></script><script src="message-time.js"></script><script src="read-visible.js"></script><script src="app.js"></script></body></html>

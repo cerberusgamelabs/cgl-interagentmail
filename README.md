@@ -1,12 +1,31 @@
 # InterAgentMail
 
+Developed at Cerberus Game Labs with **Rowan — AI development collaborator**,
+under the direction and review of the human project owner. Rowan's contributions
+include IAM Messenger and its supporting coordination systems. AI authorship is
+credited openly; it does not replace human release approval or security review.
+
 [![Support Cerberus Game Labs on Ko-fi](https://img.shields.io/badge/Ko--fi-Support%20Cerberus%20Game%20Labs-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/cerberusgamelabs)
 
 InterAgentMail gives local Codex project agents durable mailboxes, MCP tools, and automatic wake-up delivery. Messages are stored as JSON on disk, so they remain queued while Codex or the receiving agent is offline.
 
-One shared Codex app-server and one background InterAgentMail supervisor manage every registered project. The supervisor watches every mailbox but opens an isolated app-server connection only when that mailbox has new work, then releases it after the Codex turn is idle. Users do not need a bridge terminal, a port per agent, or copied Codex session IDs.
+Codex's CLI-managed local app-server daemon and one background InterAgentMail supervisor manage every registered project. The supervisor watches every mailbox but opens an isolated stdio proxy only when that mailbox has new work, then releases it after the Codex turn is idle. Users do not need a bridge terminal, a port per agent, or copied Codex session IDs.
 
 ## Requirements
+
+### Optional Windows desktop preview
+
+IAM also includes an opt-in standalone buddy list and conversation windows, with
+agent-controlled profiles and explicitly addressed replies rather than terminal
+transcripts. See [Desktop setup and privacy boundaries](docs/DESKTOP.md). When
+enabled it starts with `iam start` and closes with `iam stop`; CLI-only users do
+not need Electron or Node. Version 1.5 includes the desktop source and assets in
+the Python package. The optional Electron runtime requires a separate npm
+installation; pip does not install an Android app or activate a hosted relay.
+
+The [Android pilot source](mobile/README.md) includes owner-paired conversations
+and consent-scoped friend chats. Hosted account admission and device acceptance
+are separate from source availability.
 
 - Python 3.10 or newer
 - The OpenAI Codex CLI installed, available on `PATH`, and signed in
@@ -129,11 +148,24 @@ iam capabilities --json
 - `iam doctor` runs read-only health checks for IAM, Codex, services, project registration, MCP configuration, mailboxes, safety policy, and resumable threads.
 - `iam report` creates a privacy-sanitized Markdown support report under the IAM data directory.
 - `iam user` manages human mailboxes; `iam web` manages the separate authenticated browser companion; `iam connect` manages an outbound WebConnect transport client.
-- `iam open` resumes the saved project thread, or starts a new remote session when the project has not needed one yet.
-- `iam stop` stops mail delivery but leaves the shared app-server running.
-- Messages default to `normal`. Send `--priority urgent` only when a running agent needs a safe-stop notice; urgent mail steers active turns but never interrupts a command or bypasses approval.
-- `iam stop --all` stops both IAM-managed background services.
+- `iam open` resumes the saved project thread through the local CLI-managed daemon, or starts a new session when the project has not needed one yet. Before a resume, IAM applies the registered approval and sandbox policy through app-server and opens no terminal if that fails.
+- `iam stop` stops shared delivery while leaving the app-server running. It is not project-local.
+- Messages default to `normal`. Send `--priority urgent` only when a running agent needs a safe-stop notice; urgent mail steers only a turn started by the current IAM delivery session with its registered policy. Unknown or approval-paused turns keep mail queued.
+- `iam stop --all` also stops an IAM-owned app-server, including an active standalone server. `iam restart` uses this all-stop path; it is not supervisor-only. These commands do not stop the CLI-managed daemon.
 - `iam unregister` removes IAM's managed MCP block and project registration while preserving mailbox data.
+
+## Shared-service operational safety
+
+Agents must not autonomously run `iam stop`, `iam stop --all`, `iam restart`,
+or equivalent process termination for routine repairs. Obtain explicit human
+owner clearance for the exact operation and coordinated time; general task
+approval or another agent's reply is not enough. Re-confirm stale clearance
+if the window or active-work conditions have changed.
+
+Only an immediate, evidenced emergency where waiting would cause greater harm
+and obtaining approval is unsafe permits autonomous containment. Stuck mail,
+timeouts and pending reloads are not emergencies. Use the narrowest necessary
+action and report it immediately. See [operational safety](docs/INSTALL.md#shared-service-operational-safety).
 
 ## Timers and teams
 
@@ -207,6 +239,24 @@ than the exact empty mailbox shape created by `InterAgentMail init`.
 
 ## Automation and reviewer platforms
 
+Local preview: [self-scheduled heartbeats](docs/HEARTBEATS.md) offer optional,
+named one-shot schedules on an existing session, globally spaced at least 15
+minutes apart. Overdue schedules coalesce; pause preserves them; uncertain
+delivery holds only heartbeats until evidence resolves it. No automatic rearming.
+They are disabled until explicitly enabled by the owner.
+
+Local preview: [external attention fast path](docs/FAST_PATH.md) provides an
+owner-registered, authenticated loopback adapter for consent-gated cDiscord
+notifications into an exact existing session. Disabled by default, idle-only,
+with durable duplicate suppression and held uncertain submissions. Registration
+does not enable resident attention records; future steering requires fresh consent.
+
+Local preview: [generic event hooks](docs/HOOKS.md) provide a separate,
+opt-in loopback broker for external adapters and restricted consumers. They do
+not run agents or grant project-operation authority, and are not started by
+`iam start`. Real consumers require a separate isolation review before enabling
+targets. This preview is not part of the published 1.4.0 interface below.
+
 Version 1.2 adds a stable JSON interface for tools that create reviewer projects or manage agent fleets:
 
 ```console
@@ -241,7 +291,7 @@ Use `iam report --stdout` to inspect or pipe the report, `iam report --output PA
 
 ## Safety
 
-New agents use `workspace-write` with `on-request` approvals. The unattended supervisor rejects interactive approval requests instead of granting them. A task that needs approval remains uncompleted until a person opens that agent.
+New agents use `workspace-write` with `on-request` approvals. The unattended supervisor rejects interactive approval requests instead of granting them. Trusted projects can instead be registered with `--approval-policy never` (and, when explicitly intended, `--full-access`); IAM carries those settings into every background turn and resumed CLI session so headless delivery does not silently inherit a stricter default.
 
 Only for a trusted project that genuinely requires unrestricted filesystem and network access:
 

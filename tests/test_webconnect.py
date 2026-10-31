@@ -15,6 +15,106 @@ from unittest.mock import patch, MagicMock
 
 
 class WebConnectTests(unittest.TestCase):
+    def test_directory_names_refresh_without_changing_routing(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        with patch.object(client, 'project_mailboxes', return_value=['Agent']), patch('iam_webconnect.iam.profile', return_value={'display_name': 'Iris'}):
+            directory = client.mailbox_directory()
+            self.assertEqual(['Agent'], directory['mailboxes'])
+            self.assertEqual('Iris', directory['display_names']['Agent'])
+        with patch.object(client, 'project_mailboxes', return_value=['Agent']), patch('iam_webconnect.iam.profile', return_value={'display_name': 'New name'}):
+            self.assertEqual('New name', client.mailbox_directory()['display_names']['Agent'])
+        with patch.object(client, 'project_mailboxes', return_value=['Agent']), patch('iam_webconnect.iam.profile', side_effect=ValueError('bad profile')):
+            self.assertEqual({}, client.mailbox_directory()['display_names'])
+
+    def test_email_registration_uses_bound_identity_and_configured_node(self):
+        import io
+        import json
+        from iam_webconnect import email_registration
+        bound = MagicMock(address='Agent')
+        with patch('iam_webconnect.load_config', return_value=self.config), patch('iam_webconnect.urlopen', return_value=io.BytesIO(b'{"primary":null}')) as opened:
+            self.assertEqual({'primary': None}, email_registration(bound, 'register', 'chosen'))
+            request = opened.call_args.args[0]
+            self.assertIn('/v1/node-email/', request.full_url)
+            self.assertEqual({'mailbox': 'Agent', 'action': 'register', 'local': 'chosen'}, json.loads(request.data))
+        with self.assertRaises(WebConnectError):
+            email_registration(bound, 'policy')
+
+    def test_relative_outbound_attachments_use_registered_sender_not_cwd(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        source = self.root / "Agent" / "note.txt"
+        source.write_text("sender content", encoding="utf-8")
+        iam.write_atomic(iam.CONFIG, {"projects": {"Agent": {"project_root": str(source.parent)}}})
+        with patch.object(client, "upload_attachment", return_value={"id": "uploaded"}) as upload:
+            result = client.outbound_attachments({"from": "Agent", "attachments": [{"path": "note.txt"}]})
+        self.assertEqual([{"id": "uploaded"}], result)
+        self.assertEqual(source.resolve(), Path(upload.call_args.args[0]["path"]))
+
+    def test_relative_outbound_attachment_rejects_unknown_sender_and_escape(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        iam.write_atomic(iam.CONFIG, {"projects": {"Agent": {"project_root": str(self.root / "Agent")}}})
+        with patch.object(client, "upload_attachment") as upload:
+            for sender, path in (("Unknown", "note.txt"), ("Agent", "../outside.txt")):
+                with self.subTest(sender=sender), self.assertRaises(WebConnectError):
+                    client.outbound_attachments({"from": sender, "attachments": [{"path": path}]})
+            upload.assert_not_called()
+
+    def test_failed_attachment_does_not_block_mail_and_retries_without_loss(self):
+        client = WebConnectClient({**self.config, "human_mailboxes": ["Liliana", "Echo"]}, ConnectorState())
+        self.agent.send(["Liliana"], "Broken", "Keep this pending")
+        self.agent.send(["Echo"], "Healthy", "Deliver this")
+        original = client.outbound_attachments
+        def failing(message):
+            if message["subject"] == "Broken":
+                raise OSError("upload unavailable")
+            return original(message)
+        with patch.object(client, "outbound_attachments", side_effect=failing) as upload:
+            client.queue_replies()
+            client.queue_replies()
+            self.assertEqual(2, upload.call_count)  # Failed message is backed off.
+        self.assertEqual(["Healthy"], [f["payload"]["subject"] for f in client.state.outbound.values()])
+        self.assertEqual(1, len(client.state.observed_local))
+        client._attachment_retry_at.clear()
+        client.queue_replies()
+        client.queue_replies()
+        self.assertEqual({"Healthy", "Broken"}, {f["payload"]["subject"] for f in client.state.outbound.values()})
+        self.assertEqual(2, len(client.state.outbound))
+        self.assertEqual(2, len(client.state.observed_local))
+
+    def test_external_sender_is_distinct_from_routing_owner_and_replies_still_route(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        frame = {"type": "mail", "id": "external-test", "node": "liliana-primary",
+                 "payload": {"from": "Liliana", "to": ["Agent"], "subject": "Hello",
+                             "body": "First line\nSecond line", "origin": "external_email",
+                             "external_email": {"id": "external-123", "from": "Hanya <hanya@example.test>",
+                                                "reply_to": "hanya@example.test"}}}
+        asyncio.run(client.receive_mail(frame))
+        message = self.agent.inbox()[0]
+        self.assertEqual("Liliana", message["routing_owner"])
+        self.assertEqual("Hanya <hanya@example.test> [external email]", message["from_display"])
+        self.assertTrue(message["metadata"]["external_email"]["approval_required"])
+        self.assertIn("not owner authorization", message["body"])
+        self.assertTrue(message["body"].endswith("First line\nSecond line"))
+        from iam_codex_bridge import delivery_prompt
+        prompt = delivery_prompt([message])
+        self.assertIn("[EXTERNAL: owner approval required", prompt)
+        self.assertIn("Hanya <hanya@example.test>", prompt)
+        self.agent.reply(message["id"], "A substantive answer")
+        client.queue_replies()
+        reply = next(iter(client.state.outbound.values()))
+        self.assertEqual("external-123", reply["payload"]["external_email_id"])
+        asyncio.run(client.receive_mail(frame))
+        self.assertEqual(1, len(self.agent.inbox()))
+
+    def test_external_mail_cannot_fall_back_to_owner_identity(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        for external in (None, {"id": "bad"}):
+            frame = {"type": "mail", "id": "invalid-external", "node": "liliana-primary",
+                     "payload": {"from": "Liliana", "to": ["Agent"], "origin": "external_email",
+                                 "external_email": external}}
+            with self.assertRaises(WebConnectError):
+                asyncio.run(client.receive_mail(frame))
+        self.assertEqual([], self.agent.inbox())
+
     def test_attachment_rejects_unsafe_paths_and_sizes_before_network(self) -> None:
         client = WebConnectClient(self.config, ConnectorState())
         manifest = {"id": "attachment-123", "name": "note.txt", "size": 5, "sha256": hashlib.sha256(b"hello").hexdigest()}
@@ -112,6 +212,29 @@ class WebConnectTests(unittest.TestCase):
         iam.save_profile("Liliana", profile)
         with self.assertRaises(WebConnectError):
             validate_config(self.config)
+
+    def test_outbound_recipient_case_and_cc_preserve_canonical_address(self):
+        for field in ("to", "cc"):
+            with self.subTest(field=field):
+                client = WebConnectClient(self.config, ConnectorState())
+                message = {"id": "case-test", "from": "Agent", field: ["lILIANa"],
+                           "subject": "Hello", "body": "First\nSecond", "attachments": []}
+                human = client.humans["Liliana"]
+                with patch.object(human, "inbox", return_value=[message]):
+                    client.queue_replies()
+                    client.queue_replies()
+                self.assertEqual(1, len(client.state.outbound))
+                payload = next(iter(client.state.outbound.values()))["payload"]
+                self.assertEqual(["Liliana"], payload["to"])
+                self.assertEqual("First\nSecond", payload["body"])
+
+    def test_outbound_skips_case_variant_self_and_unrelated_recipient(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        messages = [{"id": "self", "from": "LILIANA", "to": ["Liliana"]},
+                    {"id": "other", "from": "Agent", "to": ["Echo"]}]
+        with patch.object(client.humans["Liliana"], "inbox", return_value=messages):
+            client.queue_replies()
+        self.assertEqual({}, client.state.outbound)
 
     def test_legacy_configuration_defaults_to_enabled_but_requires_a_boolean(self) -> None:
         config = dict(self.config)

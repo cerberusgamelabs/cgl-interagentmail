@@ -7,7 +7,17 @@ include SECURITY.md
 include pyproject.toml
 recursive-include docs *.md
 recursive-include scripts *.ps1
+include scripts/audit_mobile_apk.py
+include scripts/check_installed_modules.py
+include scripts/check_python_regression.py
 recursive-include tests *.py
+recursive-include desktop *.cjs *.json *.html *.css *.js
+recursive-include desktop/assets *.png *.ico
+recursive-include desktop/public/emoji *.png *.txt
+exclude docs/DESKTOP_099_READINESS.md
+exclude docs/MOBILE_099_ACCEPTANCE.md
+prune artifacts
+prune desktop/node_modules
 prune .agents
 prune .codex
 prune .git
@@ -16,6 +26,7 @@ prune build
 prune chats
 prune attachments
 prune teams
+prune hooks
 prune orphaned-mailboxes
 prune DEV
 prune dist

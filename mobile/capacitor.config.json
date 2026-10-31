@@ -1,0 +1,8 @@
+{
+  "appId": "xyz.cerberusgamelabs.iam.messenger",
+  "appName": "IAM Messenger",
+  "webDir": "dist",
+  "server": {"androidScheme": "https", "hostname": "localhost", "cleartext": false},
+  "android": {"allowMixedContent": false, "webContentsDebuggingEnabled": false},
+  "loggingBehavior": "none"
+}

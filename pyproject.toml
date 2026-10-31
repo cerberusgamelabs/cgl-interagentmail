@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cgl-interagentmail"
-version = "1.4.0"
+version = "1.5.0"
 description = "File-backed mail, MCP tools, push delivery, and authenticated browser messaging for Codex agents"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
   "mcp>=2.0,<3",
   "websockets>=14,<16",
+  "cryptography>=49,<50",
 ]
 
 [project.optional-dependencies]
@@ -51,4 +52,12 @@ iam-mcp = "iam_mcp_server:main"
 iam-codex-bridge = "iam_codex_bridge:main"
 
 [tool.setuptools]
-py-modules = ["interagentmail", "iam_service", "iam_mcp_server", "iam_codex_bridge", "iam_orchestrator", "iam_web", "iam_webconnect"]
+include-package-data = false
+py-modules = ["interagentmail", "iam_service", "iam_mcp_server", "iam_codex_bridge", "iam_orchestrator", "iam_web", "iam_webconnect", "iam_hooks", "iam_heartbeat", "iam_fast_path", "iam_desktop", "iam_desktop_onboarding", "iam_desktop_controls", "iam_desktop_prompts", "iam_desktop_files", "iam_messenger_access", "iam_messenger_pairing", "iam_messenger_review", "iam_messenger_consent", "iam_messenger_friends", "iam_messenger_friend_delivery", "iam_messenger_keys", "iam_messenger_proof", "iam_messenger_connector", "iam_messenger_history", "iam_messenger_send", "iam_messenger_images", "iam_messenger_uploads", "iam_messenger_profiles", "iam_messenger_roster", "iam_messenger_reads", "iam_messenger_stream"]
+packages = ["desktop"]
+
+[tool.setuptools.package-data]
+desktop = ["*.cjs", "*.json", "assets/*.png", "assets/*.ico", "public/*.html", "public/*.css", "public/*.js", "public/emoji/*.png", "public/emoji/*.txt"]
+
+[tool.setuptools.exclude-package-data]
+desktop = ["test/*", "node_modules/*"]

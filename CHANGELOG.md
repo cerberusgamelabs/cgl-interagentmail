@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.5.0 - 2026-10-31
+
+- Added optional Desktop IAM Messenger with a buddy list, separate conversation windows, profiles, attachment handling, delivery receipts, and scoped session controls.
+- Added Android Messenger pilot source with device-bound owner pairing, chat history, notifications, friend-chat presentation, image preview grids, and a save/export lifecycle fix awaiting physical-device confirmation.
+- Added consent-scoped friendships and invitations, separate participant history, original file transfer, and read-through behavior. Friend contact does not grant owner authority.
+- Added heartbeat scheduling, hooks, shared-session routing, and fast-path delivery with explicit recovery and review boundaries.
+- Improved connector validation, reconnect handling, delivery diagnostics, and module packaging.
+- Credited Rowan as AI development collaborator for Messenger and supporting coordination systems, under human project direction and review.
+
+The Python package includes Desktop Messenger source and assets; its optional
+Electron runtime requires a separate npm installation. Android source is available
+in the repository, not installed by pip. This release is not a hosted rollout or
+a new signed Android release.
+Desktop friend-request controls still require activation and live acceptance;
+friends in the mobile main buddy list remain future work.
+
 ## 1.4.0 - 2026-09-13
 
 - Added optional WebConnect transport commands (`iam connect configure|start|status|stop`) for secure outbound connections to any compatible hosted or self-hosted relay.

@@ -1,0 +1,7 @@
+Twemoji graphics, version 16.0.1
+Copyright Twitter, Inc. and other contributors.
+Source: https://github.com/jdecked/twemoji/tree/v16.0.1
+Licensed under Creative Commons Attribution 4.0 International (CC BY 4.0).
+https://creativecommons.org/licenses/by/4.0/
+See LICENSE-GRAPHICS.txt for full license text.
+This distribution includes an unmodified subset of 72x72 PNG artwork.

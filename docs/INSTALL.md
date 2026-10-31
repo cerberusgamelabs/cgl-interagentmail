@@ -13,6 +13,26 @@ InterAgentMail is open-source software distributed under the MIT License.
 
 One IAM installation can manage any number of projects for one operating-system user.
 
+### Maintainer check for editable installations
+
+An editable install can expose changed source while retaining an older module
+discovery map. After adding modules to `pyproject.toml`, refresh the installation
+using the interpreter that runs IAM, then verify discovery outside the checkout:
+
+```cmd
+.venv\Scripts\python.exe -m pip install --no-deps --editable .
+.venv\Scripts\python.exe scripts\check_installed_modules.py
+```
+
+The check uses an isolated Python subprocess in a temporary directory and must
+report an empty `missing` list. Running imports from the repository root is not
+a substitute: that can hide missing installed modules. `--no-deps` is appropriate
+only when runtime dependencies are already provisioned; it does not validate them.
+Already-running Python processes may retain the previous editable finder in
+memory. Coordinate any required component reload separately; never use a shared
+IAM/Codex restart as an implicit installation step. Passing discovery is not an
+end-to-end delivery or service-health check.
+
 ## Windows installation
 
 ### 1. Install and sign in to Codex CLI
@@ -161,7 +181,7 @@ Run this once after signing in or rebooting:
 iam start
 ```
 
-`iam start` launches one local Codex app-server and one IAM supervisor in the background. The supervisor watches every registered mailbox but opens an isolated app-server connection only when a mailbox has undelivered mail. It retains that connection while a turn is active or awaiting approval, then releases it after the turn is idle. It does not open one terminal per agent. Running it again is harmless.
+`iam start` asks the Codex CLI to start its managed local app-server daemon, then launches one hidden IAM supervisor. The supervisor watches every registered mailbox but opens an isolated stdio proxy only when a mailbox has undelivered mail. It retains that connection while a turn is active or awaiting approval, then releases it after the turn is idle. It does not open one terminal per agent. Running it again is harmless.
 
 Check everything with:
 
@@ -183,7 +203,7 @@ Or name the folder from anywhere:
 iam open "C:\Projects\SecurityReviewer"
 ```
 
-Open other agents in other terminal tabs. They share the same app-server but retain separate project folders, mailboxes, and Codex threads. Background delivery uses isolated temporary connections, so one unavailable project does not prevent the others from receiving mail.
+Open other agents in other terminal tabs. They share the CLI-managed daemon but retain separate project folders, mailboxes, and Codex threads. Background delivery uses isolated temporary proxies, so one unavailable project does not prevent the others from receiving mail. IAM applies the registered sandbox and approval policy before resuming a terminal; a failed policy application leaves the pin unchanged and opens no terminal.
 
 If the receiving Codex UI is closed, the background supervisor can still wake its saved thread and perform work. If a task requires interactive approval, it fails closed; open that agent to review the request.
 
@@ -244,7 +264,26 @@ Full access removes the Codex filesystem sandbox for mail-triggered turns. Do no
 
 ## Update
 
-After a new release is published:
+### Shared-service operational safety
+
+Agents must not autonomously run `iam stop`, `iam stop --all`, `iam restart`,
+or equivalent process termination for routine repairs. Stop suspends shared
+delivery; restart uses the all-stop path and can interrupt every session on
+the IAM-owned app-server. It is not a supervisor-only reload.
+
+Normal maintenance requires the human owner's explicit clearance for the exact
+operation and coordinated time. At Cerberus Game Labs that owner is Liliana.
+General repair approval or another agent's reply is insufficient. Re-confirm
+if the maintenance window or active-work conditions have changed; a delayed
+reply must not trigger a badly timed restart. Inspect command scope first.
+
+Only an immediate, evidenced emergency where waiting would cause greater harm
+and obtaining clearance is unsafe permits autonomous containment. Stuck mail,
+timeouts, failed tests and pending reloads do not qualify. Use the narrowest
+necessary action, preserve evidence, and report the reason, affected services
+and recovery state immediately. When uncertain, stop and ask.
+
+After a new release is published, in an owner-approved maintenance window:
 
 ```cmd
 pipx upgrade cgl-interagentmail
@@ -298,16 +337,17 @@ iam report
 
 By default the report is written under the IAM data directory's `reports` folder. It includes versions, service health, registration and MCP checks, mailbox counts, and log statistics. It excludes mailbox and chat contents, thread IDs, raw configuration, environment variables, and raw app-server log lines. Project names and paths, user paths, email addresses, IDs, and common credential formats are replaced. Review the generated file before sharing it publicly.
 
-Use `iam report --output PATH` to choose a destination or `iam report --stdout` to print it. IAM refuses to replace an existing output file unless `--force` is provided. After reviewing the diagnosis, `iam restart` remains the usual way to restart both managed background services.
+Use `iam report --output PATH` to choose a destination or `iam report --stdout` to print it. IAM refuses to replace an existing output file unless `--force` is provided. Do not automatically follow diagnosis with `iam restart`: it uses the all-stop path and can interrupt all sessions on the shared IAM-owned app-server. Follow the shared-service operational safety policy above.
 
-Logs are under `run/app-server.log`, `run/supervisor.log`, and, when configured, `run/web.log` inside the IAM data directory.
+IAM logs are under `run/supervisor.log` and, when configured, `run/web.log` inside the IAM data directory. The supervisor log rotates at 10 MiB with three backups. `run/app-server.log` may remain from a pre-managed-daemon installation but is no longer written by the default setup.
 
 Common issues:
 
 - **`iam` is not recognized:** close and reopen the terminal after `pipx ensurepath`; then run `py -m pipx ensurepath` again if needed.
 - **Codex was not found:** verify `codex --version` in the same terminal and complete the Codex sign-in flow.
 - **A mailbox does not wake:** confirm its project appears in `iam status`; then check `supervisor.log`. Each new message activates only that mailbox's temporary delivery connection, so other projects remain unaffected by a failed attachment.
-- **Port 4500 is occupied:** stop an old manual `codex app-server` or use a consistent custom `--url` with IAM commands.
+- **Port 4500 is occupied:** the default managed transport uses no TCP port. If you explicitly use a legacy `--url ws://...`, stop the old listener or consistently choose another loopback URL.
+- **Windows helper windows flash during turns:** the opt-in [hidden-console compatibility mode](WINDOWS_CONSOLE_WORKAROUND.md) runs an IAM-owned shared server without rebuilding Codex. Read its maintenance-window switch steps, limitations, and loopback security warning before enabling it.
 - **Work waits for approval:** open the receiving project with `iam open` and review the request. IAM never grants an unattended approval automatically.
 - **An old bridge is also running:** stop manually launched `IAMBridge` or `iam-codex-bridge` processes; the supervisor replaces them.
 - **A thread cannot resume:** IAM preserves the existing thread ID and queues work. Check `iam doctor` and the supervisor log; retry after transient app-server failures. To explicitly select another saved session for the same project, use `iam open --thread-id SESSION_ID`. Restarting does not silently replace a pinned thread.

@@ -1,0 +1,108 @@
+:root{color-scheme:dark;font:16px system-ui,sans-serif;background:#171923;color:#f5f5fb}*{box-sizing:border-box}body{margin:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}header{padding:20px;background:#454974;border-bottom:3px solid #eebc62}h1{font-size:1.5rem;margin:0}h2{font-size:1.15rem}main{padding:16px;max-width:650px;margin:auto}label{display:block;margin:16px 0}input,button{font:inherit;color:inherit;border:1px solid #62678a;border-radius:10px;padding:12px;background:#252837}input{display:block;width:100%;margin-top:6px}button{margin:6px 6px 6px 0;min-height:48px}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#252837;padding:12px;border-radius:10px}p{line-height:1.5;overflow-wrap:anywhere}article{padding:16px;margin:14px 0;background:#252837;border-radius:16px;white-space:pre-wrap;overflow-wrap:anywhere}article.owner{background:#39334f;margin-left:24px}small{display:block;color:#bcc4ef}#status{border-left:3px solid #eebc62;padding:10px} [hidden]{display:none!important}
+:root #composer{padding:16px;max-width:650px;margin:auto}
+textarea{display:block;width:100%;font:inherit;color:inherit;background:#252837;border:1px solid #62678a;border-radius:10px;padding:12px;resize:vertical}
+#photoPreview{display:block;max-width:100%;max-height:240px;object-fit:contain}#imageViewer{max-width:96vw;max-height:96vh;background:#171923;color:#fff;border:1px solid #62678a}#viewImage{display:block;max-width:85vw;max-height:80vh;object-fit:contain}dialog::backdrop{background:#000b}
+
+#messages article{position:relative;margin-bottom:24px}
+.message-meta{position:absolute;right:9px;bottom:0;transform:translateY(50%);display:flex;justify-content:flex-end;align-items:center;gap:6px;padding:2px 6px;border-radius:7px;background:#171923;color:#b2b8ce;font-size:10px;line-height:1.3;font-variant-numeric:tabular-nums;white-space:normal;text-align:right;max-width:calc(100% - 18px)}
+/* A bounded app shell: history grows inside its own scroller, never the page. */
+html{height:100%;overflow:hidden}
+body{height:100vh;height:var(--visible-height,100dvh);overflow:hidden;display:flex;flex-direction:column}
+header{flex:none;padding:6px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+header h1{font-size:1.1rem}header button{margin:0;padding:6px 12px;min-height:44px}
+main{flex:1;min-height:0;width:100%;max-width:650px;margin:0 auto;padding:0;display:flex;flex-direction:column;overflow:hidden}
+#controls{flex:none;max-height:35%;overflow-y:auto;padding:0 12px;overscroll-behavior:contain}
+body:not(.chat-ready) #controls{flex:1;max-height:none}
+#status{font-size:.8rem;line-height:1.3;padding:4px 8px;margin:4px 0}
+#activeConversation{font-size:.95rem;margin:4px 0}summary{cursor:pointer;padding:6px 0}
+#messages{flex:1;min-height:0;overflow-y:auto;overflow-anchor:none;overscroll-behavior:contain;padding:0 12px 12px}
+body:not(.chat-ready) #messages{display:none}
+:root #composer{flex:none;width:100%;margin:0 auto;padding:8px 12px;max-height:48%;overflow-y:auto;background:#171923;border-top:1px solid #62678a;overscroll-behavior:contain}
+#composer label{margin:0}#composer textarea{resize:none;min-height:64px;max-height:120px;padding:8px}
+#composer button{min-height:44px;padding:6px 10px;margin:4px 4px 0 0}
+#count{display:inline;font-size:.7rem}#send{float:right}#sendDetails{clear:both;font-size:.85rem}
+#photoPreview{max-height:72px;max-width:96px;float:right}#pending{font-size:.8rem}
+@media(max-height:450px){header{padding:2px 10px}header h1{font-size:1rem}#controls{max-height:25%}:root #composer{padding:4px 10px;max-height:58%}#composer textarea{min-height:48px}#composer label{font-size:.8rem}}
+
+.compose-row{display:flex;align-items:flex-end;gap:6px;width:100%;min-width:0}
+#composer .compose-row button{flex:none;margin:0;min-height:44px;max-width:96px;overflow-wrap:anywhere}
+#composer #pickImage{width:44px;font-size:1.5rem;padding:0}
+#composer #draft{flex:1;min-width:0;min-height:44px;height:44px;max-height:120px;line-height:24px;padding:9px 10px;overflow-y:auto}
+#composer #send{float:none;padding:6px 10px}
+#selectedPhoto{display:flex;align-items:center;gap:8px;margin-top:6px}
+#selectedPhoto #photoPreview{float:none;width:64px;height:48px;margin:0}
+#sendDetails summary{font-size:.75rem;padding:4px 0;min-height:24px}
+#count{display:block}
+
+/* Buddy list is a destination, not a collapsible panel above the chat. */
+header h1{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#buddyPanel{padding-bottom:16px}
+#buddyPanel h2{font-size:1.35rem;margin:16px 0 8px}
+#buddyPanel label{margin:12px 0}
+#buddies{display:grid;gap:8px}
+#buddies button{display:flex;align-items:center;gap:10px;width:100%;margin:0;text-align:left;white-space:normal;padding:9px;min-height:60px}
+.buddy-avatar{display:grid;place-items:center;flex:none;width:38px;height:38px;border-radius:11px;background:#393e61;color:#fff;font:bold 23px Georgia,serif}
+.buddy-info{flex:1;min-width:0}
+.buddy-info strong,.buddy-info small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.buddy-info small{margin-top:3px;color:#bcc4ef;font-size:.75rem}
+.buddy-unread{max-width:72px;flex:none;color:#ffc477;font-size:.72rem;text-align:right}
+#buddySummary,.scope-note{color:#bcc4ef;font-size:.85rem}
+#emptyBuddies{padding:20px 12px;border:1px dashed #62678a;border-radius:10px}
+#backHome,#connectionSettings{font-size:.85rem;padding:6px 8px}
+select{display:block;width:100%;margin-top:6px;font:inherit;color:inherit;border:1px solid #62678a;border-radius:10px;padding:12px;background:#252837}
+#accountHelp{padding-bottom:16px}#accountHelp p{font-size:.85rem;color:#bcc4ef}
+#textViewer{width:min(90vw,48rem);max-height:85dvh;overflow:auto}
+#fullText{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;user-select:text}
+#selectedFiles{max-height:120px;overflow-y:auto;overscroll-behavior:contain}
+#selectedFiles>div{display:flex;align-items:center;gap:8px}
+#selectedFiles span{flex:1;min-width:0;overflow-wrap:anywhere;font-size:.8rem}
+#selectedFiles button{flex:none}
+body.chat-ready #status,body.chat-ready #liveStatus{display:none}
+#headerIdentity{flex:1;min-width:0}#headerIdentity h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#profileHeader{flex:none;width:56px;height:56px}#chatPortrait,#chatAvatar{width:56px;height:56px;border-radius:14px;object-fit:cover}
+#chatAvatar{display:grid;place-items:center;background:#393e61;font:bold 30px Georgia,serif}
+#profileLines small{font-size:.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}
+#headerActions{flex:none;text-align:right}#chatContext{font-size:.65rem;max-width:110px;margin-top:4px}
+#chatHelp{background:#171923;color:#f5f5fb;border:1px solid #62678a;width:min(94vw,500px);max-height:85dvh;overflow-y:auto}
+#connectionNotice{font-size:.8rem;margin:4px 0;padding:4px;border-left:3px solid #eebc62}
+#pendingNotice{font-size:.75rem;max-width:100%;overflow-wrap:anywhere}
+.delivery-marker{display:inline-flex;width:15px;height:15px;align-items:center;justify-content:center;border:1px solid currentColor;border-radius:50%;font-size:10px;margin-left:6px;vertical-align:middle}
+.buddy-avatar{object-fit:cover}
+#friendships{background:#171923;color:#f5f5fb;border:1px solid #62678a;width:min(94vw,600px);max-height:88dvh;overflow-y:auto}
+#friendships p{overflow-wrap:anywhere;white-space:pre-wrap}
+#friendships .friend-history{max-height:40dvh;overflow:auto;border-block:1px solid #62678a;padding:8px}
+/* Friend conversations share the owner-chat presentation, never its privileges. */
+#friendships.friend-chat{position:fixed;inset:0;margin:0;width:100%;max-width:none;height:var(--visible-height,100dvh);max-height:none;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);border:0;overflow:hidden}
+#friendships.friend-chat[open]{display:flex;flex-direction:column}
+.friend-chat .friend-content{flex:1;min-height:0;display:flex;flex-direction:column;width:100%;max-width:650px;margin:auto;overflow:hidden}
+.friend-chat .friend-header{flex:none;padding:8px 12px}
+.friend-header .buddy-avatar{width:56px;height:56px;border-radius:14px}
+.friend-header h1{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.friend-header button{font-size:.8rem;padding:6px 8px}
+#friendships.friend-chat .friend-history{flex:1;min-height:0;max-height:none;border:0;overflow-y:auto;overflow-anchor:none;overscroll-behavior:contain;padding:0 12px 14px}
+.friend-history article{position:relative;margin:14px 24px 24px 0;padding:14px;border-radius:16px}
+.friend-history article.owner{margin-left:24px;margin-right:0}
+#friendships .message-body{margin:0;white-space:pre-wrap}
+.friend-history article button{max-width:100%;font-size:.8rem;white-space:normal;overflow-wrap:anywhere}
+.friend-notice:empty{display:none}
+.friend-chat .friend-notice{flex:none;margin:0;padding:6px 12px;border-left:3px solid #eebc62;font-size:.8rem;max-height:20%;overflow:auto}
+.friend-chat .friend-help{flex:none;max-height:40%;overflow:auto;padding:8px 12px;border-bottom:1px solid #62678a;font-size:.8rem}
+.friend-typing{flex:none;min-height:16px;font-size:.75rem;margin:0 12px;color:#bcc4ef}
+.friend-composer{flex:none;max-height:48%;overflow:auto;border-top:1px solid #62678a;padding:8px 12px}
+.friend-composer .compose-row button{flex:none;margin:0;min-height:44px;padding:6px 10px;max-width:100px;font-size:.85rem}
+.friend-composer .compose-row textarea{flex:1;min-width:0;min-height:44px;max-height:120px;resize:none;line-height:24px;padding:9px 10px}
+.friend-composer p,.friend-selected-files{font-size:.75rem}
+.friend-selected-files:empty{display:none}
+.friend-selected-files{max-height:80px;overflow:auto}
+.friend-selected-files button{min-height:32px;padding:4px 8px;margin:0 4px 4px 0}
+.friend-chat .friend-older{flex:none;align-self:center;min-height:32px;margin:2px;padding:4px 10px;font-size:.75rem}
+.image-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:4px;width:100%;margin:8px 0;aspect-ratio:1.3;overflow:hidden;border-radius:10px}
+.image-grid[data-count="1"]{grid-template-columns:1fr;aspect-ratio:1.3}
+.image-grid[data-count="2"]{aspect-ratio:1.6}
+.image-grid[data-count="3"],.image-grid[data-count="4"]{grid-template-rows:repeat(2,minmax(0,1fr))}
+.image-grid[data-count="3"] .image-tile:first-child{grid-column:1/-1}
+.image-grid .image-tile{min-width:0;min-height:0;width:100%;height:100%;margin:0;padding:0;border:0;border-radius:0;overflow:hidden;background:#303449;white-space:normal}
+.image-tile img{display:block;width:100%;height:100%;object-fit:cover}
+.friend-image-view{position:absolute;inset:0;z-index:5;background:#171a24;display:flex;flex-direction:column;align-items:center;padding:12px;gap:8px}
+.friend-image-view img{width:100%;min-height:0;flex:1;object-fit:contain}
+@media(max-height:450px){.friend-chat .friend-header{padding:3px 10px}.friend-header .buddy-avatar{width:40px;height:40px}.friend-composer{padding:4px 10px;max-height:55%}}

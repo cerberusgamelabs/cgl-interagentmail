@@ -11,24 +11,37 @@ import http.client
 import importlib.metadata
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import platform
 import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import interagentmail as iam
-from iam_codex_bridge import AppServerClient, AppServerError, DeliveryState, MailboxBridge
-from iam_service import IAMService
+from iam_codex_bridge import (
+    AppServerClient,
+    AppServerError,
+    DeliveryState,
+    MailboxBridge,
+    apply_registered_thread_policy,
+    background_process_kwargs,
+    thread_sandbox_mode,
+    turn_sandbox_policy,
+)
+from iam_service import IAMService, IAMError, session_owner, session_workspace
 from iam_web import (
     DEFAULT_PORT as DEFAULT_WEB_PORT,
     LAN_WARNING,
@@ -45,7 +58,8 @@ from iam_webconnect import ConnectorState, WebConnectClient, WebConnectError, lo
 
 
 LOG = logging.getLogger("iam.orchestrator")
-DEFAULT_URL = "ws://127.0.0.1:4500"
+MANAGED_ENDPOINT = "managed://"
+DEFAULT_URL = MANAGED_ENDPOINT
 MCP_BEGIN = "# BEGIN INTERAGENTMAIL (managed by `iam setup`)"
 MCP_END = "# END INTERAGENTMAIL"
 CHECK_PASS = "PASS"
@@ -55,6 +69,7 @@ INTEGRATION_SCHEMA_VERSION = "1.0"
 ADDRESS_STRATEGY = "project-folder-basename"
 SAFE_SANDBOXES = {"read-only", "workspace-write", "danger-full-access"}
 SAFE_APPROVAL_POLICIES = {"untrusted", "on-request", "never"}
+CODEX_DAEMON_PRIVATE_DIRECTORY_ERROR = "socket directory is not private to the current user"
 LOG_EVENT_PATTERNS = {
     "connection failures": re.compile(r"connection failed", re.IGNORECASE),
     "delivery failures": re.compile(r"delivery failed", re.IGNORECASE),
@@ -136,6 +151,35 @@ def save_config(data: dict[str, Any]) -> None:
     iam.write_atomic(iam.CONFIG, data)
 
 
+def configured_endpoint() -> str:
+    """Opt-in Windows compatibility transport; default remains Codex-managed."""
+    port = load_config().get("windows_hidden_console_port")
+    if port is None:
+        return DEFAULT_URL
+    if os.name != "nt" or type(port) is not int or not 1024 <= port <= 65535:
+        raise IAMError("Invalid Windows hidden-console configuration (port must be 1024..65535).")
+    return f"ws://127.0.0.1:{port}"
+
+
+def cmd_app_server_mode(args: argparse.Namespace) -> None:
+    # Do not silently move an active supervisor to a different session backend.
+    if pid_alive(read_pid("supervisor")) or pid_alive(read_pid("app-server")):
+        raise IAMError("Stop IAM with `iam stop --all` before changing app-server mode. Saved sessions are preserved.")
+    config = load_config()
+    if args.mode == "hidden-console":
+        if os.name != "nt":
+            raise IAMError("Hidden-console compatibility mode is Windows-only.")
+        if not 1024 <= args.port <= 65535:
+            raise IAMError("Port must be 1024..65535.")
+        config["windows_hidden_console_port"] = args.port
+    else:
+        config.pop("windows_hidden_console_port", None)
+    save_config(config)
+    print(f"App-server mode saved: {args.mode}. No processes were started or stopped.")
+    print("Before switching backends, exit agent terminals and stop the old Codex daemon/server.")
+    print("Then run `iam start` and reopen projects with `iam open` (not plain codex).")
+
+
 def registered_projects() -> dict[str, dict[str, Any]]:
     projects = load_config().get("projects", {})
     if not isinstance(projects, dict):
@@ -165,6 +209,15 @@ def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def mcp_python_executable() -> str:
+    """Use Python's windowless launcher for stdio MCP servers on Windows."""
+    if os.name == "nt":
+        pythonw = Path(sys.executable).with_name("pythonw.exe")
+        if pythonw.is_file():
+            return str(pythonw)
+    return sys.executable
+
+
 def mcp_block(project_root: Path) -> str:
     args = ["-m", "iam_mcp_server", "--project-root", str(project_root)]
     rendered_args = ", ".join(toml_string(item) for item in args)
@@ -191,6 +244,9 @@ def mcp_block(project_root: Path) -> str:
             "iam_timer_clear",
             "iam_timer_cancel",
             "iam_timer_snooze",
+            "schedule_next_wake",
+            "cancel_next_wake",
+            "get_heartbeat_state",
             "iam_team_add_member",
             "iam_team_remove_member",
         )
@@ -198,7 +254,7 @@ def mcp_block(project_root: Path) -> str:
     return (
         f"{MCP_BEGIN}\n"
         "[mcp_servers.interagentmail]\n"
-        f"command = {toml_string(sys.executable)}\n"
+        f"command = {toml_string(mcp_python_executable())}\n"
         f"args = [{rendered_args}]\n"
         f"required = true\n{tool_approvals}\n"
         f"{MCP_END}\n"
@@ -452,6 +508,9 @@ def setup_project(
 
 def unregister_project(project_root: str | Path) -> dict[str, Any]:
     address, root, _entry = project_entry(project_root)
+    links = load_config().get("session_mailboxes", {})
+    if address in links or address in links.values():
+        raise IAMError("Unlink shared-session mailboxes before unregistering this project")
     mcp_path = remove_project_mcp(root)
     config = load_config()
     projects = config.get("projects", {})
@@ -529,12 +588,15 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
-def spawn_background(command: list[str], name: str, *, record_pid: bool = True) -> int:
-    log_file = log_path(name).open("a", encoding="utf-8")
+def spawn_background(
+    command: list[str], name: str, *, record_pid: bool = True, capture_output: bool = True,
+    hidden_console: bool = False,
+) -> int:
+    log_file = log_path(name).open("a", encoding="utf-8") if capture_output else None
     kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
-        "stdout": log_file,
-        "stderr": subprocess.STDOUT,
+        "stdout": log_file or subprocess.DEVNULL,
+        "stderr": subprocess.STDOUT if log_file else subprocess.DEVNULL,
         "close_fds": True,
     }
     if os.name == "nt":
@@ -542,20 +604,45 @@ def spawn_background(command: list[str], name: str, *, record_pid: bool = True) 
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = subprocess.SW_HIDE
         kwargs["startupinfo"] = startupinfo
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | (
+            subprocess.CREATE_NEW_CONSOLE if hidden_console else subprocess.CREATE_NO_WINDOW
+        )
     else:
         kwargs["start_new_session"] = True
     try:
         process = subprocess.Popen(command, **kwargs)
     finally:
-        log_file.close()
+        if log_file:
+            log_file.close()
     if record_pid:
         pid_path(name).write_text(str(process.pid) + "\n", encoding="utf-8")
     return process.pid
 
 
+def is_managed_endpoint(url: str) -> bool:
+    return url == MANAGED_ENDPOINT
+
+
+def appserver_client(
+    url: str, *, request_timeout: float = 30.0, experimental_api: bool = True
+) -> AppServerClient:
+    options = {
+        "request_timeout": request_timeout,
+        "experimental_api": experimental_api,
+    }
+    if is_managed_endpoint(url):
+        if load_config().get("windows_hidden_console_port") is not None:
+            raise IAMError("Hidden-console mode must not connect to the native daemon. Use the saved loopback endpoint or explicitly switch app-server mode.")
+        return AppServerClient(
+            command=[codex_executable(), "app-server", "proxy"],
+            websocket_stdio=True,
+            **options,
+        )
+    return AppServerClient(url=url, **options)
+
+
 async def appserver_available(url: str, timeout: float = 2.0) -> bool:
-    client = AppServerClient(url=url, request_timeout=timeout)
+    client = appserver_client(url, request_timeout=timeout)
     try:
         await client.connect()
         return True
@@ -576,16 +663,165 @@ def codex_executable() -> str:
     return executable
 
 
+def repair_codex_daemon_state_acl() -> Path:
+    """Restore Codex's Windows daemon state directory to a user-private DACL."""
+    if os.name != "nt":
+        raise OSError("Codex daemon ACL repair is only supported on Windows")
+    state_dir = Path.home() / ".codex" / "app-server-daemon"
+    if not state_dir.is_dir():
+        raise OSError(f"Codex daemon state directory does not exist: {state_dir}")
+    metadata = state_dir.lstat()
+    if state_dir.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+        raise OSError(f"Refusing to repair a reparse-point daemon directory: {state_dir}")
+
+    hidden: dict[str, Any] = {"capture_output": True, "text": True, "check": False}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    hidden["startupinfo"] = startupinfo
+    hidden["creationflags"] = subprocess.CREATE_NO_WINDOW
+    identity = subprocess.run(["whoami"], **hidden)
+    account = identity.stdout.strip()
+    if identity.returncode != 0 or not account or "\\" not in account:
+        detail = (identity.stderr or identity.stdout or "could not identify the current user").strip()
+        raise OSError(f"Could not identify the Windows account for daemon ACL repair: {detail}")
+
+    commands = (
+        ["icacls", str(state_dir), "/reset"],
+        ["icacls", str(state_dir), "/grant:r", f"{account}:(OI)(CI)(F)"],
+        ["icacls", str(state_dir), "/inheritance:r"],
+    )
+    for command in commands:
+        completed = subprocess.run(command, **hidden)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "unknown icacls error").strip()
+            raise OSError(f"Could not make the Codex daemon directory private: {detail}")
+    return state_dir
+
+
+def native_daemon_running() -> bool:
+    """Passive, conservative check: never launch Codex to discover its daemon."""
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    record_path = codex_home / "app-server-daemon" / "daemon.pid"
+    try:
+        record = iam.load(record_path)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as exc:
+        raise IAMError(f"Cannot inspect native daemon state safely: {exc}") from None
+    if not isinstance(record, dict) or type(record.get("pid")) is not int or record["pid"] <= 0:
+        raise IAMError("Native daemon PID record is invalid; inspect it before starting another backend.")
+    # A recycled PID can conservatively block startup, but never authorizes
+    # stopping that PID. All shutdown remains an explicit owner action.
+    return pid_alive(record["pid"])
+
+
+def compatibility_port_available(url: str) -> bool:
+    """A failed protocol probe does not mean the listener's port is free."""
+    endpoint = urlsplit(url)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        if os.name == "nt":
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        try:
+            probe.bind((endpoint.hostname, endpoint.port))
+        except OSError:
+            return False
+    return True
+
+
 def ensure_appserver(url: str, wait_seconds: float = 15.0) -> str:
+    hidden_console = (
+        load_config().get("windows_hidden_console_port") is not None
+        and url == configured_endpoint()
+    )
+    if hidden_console:
+        with session_guard("app-server", "startup") as acquired:
+            if not acquired:
+                raise IAMError("Another IAM app-server startup is in progress; retry shortly.")
+            return _ensure_appserver(url, wait_seconds)
+    return _ensure_appserver(url, wait_seconds)
+
+
+def _ensure_appserver(url: str, wait_seconds: float = 15.0) -> str:
+    hidden_console = (
+        load_config().get("windows_hidden_console_port") is not None
+        and url == configured_endpoint()
+    )
+    if hidden_console and native_daemon_running():
+        raise IAMError("The Codex managed daemon is still running. Exit its agent terminals, then run `codex app-server daemon stop` before `iam open` or `iam start`.")
     if asyncio.run(appserver_available(url)):
+        if hidden_console:
+            marker = iam.ROOT / "run" / "app-server-console-mode.json"
+            saved = iam.load(marker) if marker.exists() else {}
+            if (saved.get("url") != url or saved.get("pid") != read_pid("app-server")
+                    or not pid_alive(saved.get("pid"))):
+                raise IAMError("The compatibility port is occupied by an unverified server. Leave it running and choose another port.")
         return "already running"
+    if hidden_console:
+        if pid_alive(read_pid("app-server")):
+            raise IAMError("The recorded compatibility server is still running but not responding. Its ownership record was preserved; retry shortly or inspect the app-server log.")
+        if not compatibility_port_available(url):
+            raise IAMError("The compatibility port is occupied but not responding. No replacement was launched and ownership records were preserved.")
+    if is_managed_endpoint(url):
+        kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "capture_output": True,
+            "text": True,
+            "timeout": wait_seconds,
+            "check": False,
+        }
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            kwargs["startupinfo"] = startupinfo
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        command = [codex_executable(), "app-server", "daemon", "start"]
+        try:
+            completed = subprocess.run(command, **kwargs)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SystemExit(f"Could not start the Codex managed daemon: {exc}") from exc
+        detail = (completed.stderr or completed.stdout or "unknown error").strip()
+        if completed.returncode != 0 and CODEX_DAEMON_PRIVATE_DIRECTORY_ERROR in detail:
+            try:
+                repaired = repair_codex_daemon_state_acl()
+                LOG.warning("Repaired stale Windows ACLs on Codex daemon state directory %s", repaired)
+                completed = subprocess.run(command, **kwargs)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise SystemExit(
+                    f"Could not start the Codex managed daemon: {detail}. "
+                    f"IAM could not repair the private directory ACL: {exc}"
+                ) from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "unknown error").strip()
+            raise SystemExit(f"Could not start the Codex managed daemon: {detail}")
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            if asyncio.run(appserver_available(url, timeout=1.0)):
+                return "managed daemon started"
+        raise SystemExit("Codex managed daemon started but its local proxy did not become available.")
     if not url.startswith("ws://127.0.0.1:") and not url.startswith("ws://localhost:"):
         raise SystemExit(f"Refusing to auto-start a non-loopback app-server: {url}")
-    pid = spawn_background([codex_executable(), "app-server", "--listen", url], "app-server")
+    command = [codex_executable(), "app-server", "--listen", url]
+    if hidden_console:
+        command.extend(["--disable", "daemon_auto_start"])
+        pid = spawn_background(command, "app-server", hidden_console=True, record_pid=False)
+    else:
+        pid = spawn_background(command, "app-server")
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         time.sleep(0.25)
+        if hidden_console and not pid_alive(pid):
+            break
         if asyncio.run(appserver_available(url, timeout=1.0)):
+            if hidden_console:
+                if not pid_alive(pid):
+                    break
+                # Publish only after this launch is alive and the endpoint is
+                # ready. A failed duplicate must never replace healthy ownership.
+                iam.write_atomic(iam.ROOT / "run" / "app-server-console-mode.json", {"pid": pid, "url": url})
+                pid_path("app-server").write_text(str(pid) + "\n", encoding="utf-8")
             return f"started (pid {pid})"
         if not pid_alive(pid):
             break
@@ -604,8 +840,11 @@ def ensure_daemon(url: str) -> str:
         pid_path("supervisor").unlink()
     except FileNotFoundError:
         pass
-    command = [sys.executable, "-m", "iam_orchestrator", "serve", "--url", url]
-    spawn_background(command, "supervisor", record_pid=False)
+    command = [
+        sys.executable, "-m", "iam_orchestrator", "serve", "--url", url,
+        "--log-file", str(log_path("supervisor")),
+    ]
+    spawn_background(command, "supervisor", record_pid=False, capture_output=False)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         time.sleep(0.1)
@@ -615,13 +854,14 @@ def ensure_daemon(url: str) -> str:
     raise SystemExit(f"InterAgentMail supervisor did not start. See {log_path('supervisor')}")
 
 
-def registry_signature(projects: dict[str, dict[str, Any]]) -> tuple[tuple[str, str, str, str], ...]:
+def registry_signature(projects: dict[str, dict[str, Any]]) -> tuple[tuple[str, ...], ...]:
     return tuple(sorted(
         (
             address,
             str(entry.get("project_root", "")),
             str(entry.get("sandbox", "workspace-write")),
             str(entry.get("approval_policy", "on-request")),
+            session_owner(address),
         )
         for address, entry in projects.items()
     ))
@@ -663,7 +903,9 @@ def supervisor_mailboxes(projects: dict[str, dict[str, Any]]) -> list[Supervisor
             continue
         service = IAMService(root)
         state = DeliveryState.load(iam.mailbox(address) / ".codex-bridge-state.json")
-        state.initialize(service.inbox(limit=1000), process_existing=False)
+        guarded = any((iam.mailbox(name) / ".delivery-requirement.json").exists()
+                      for name in (address, session_owner(address)))
+        state.initialize(service.inbox(limit=1000), process_existing=guarded)
         watched.append(SupervisorMailbox(
             address=address,
             service=service,
@@ -674,25 +916,73 @@ def supervisor_mailboxes(projects: dict[str, dict[str, Any]]) -> list[Supervisor
     return watched
 
 
-async def activate_delivery(mailbox: SupervisorMailbox, url: str) -> ActiveDelivery:
+def delivery_requirement(address: str) -> dict[str, str] | None:
+    path = iam.mailbox(address) / ".delivery-requirement.json"
+    if not path.exists():
+        return None
+    value = iam.load(path)
+    if (not isinstance(value, dict) or set(value) != {"session_owner", "thread_id"}
+            or not all(isinstance(v, str) and v.strip() for v in value.values())):
+        raise IAMError("invalid_delivery_requirement")
+    return value
+
+
+def check_delivery_requirement(address: str, actual_thread: str | None = None) -> dict[str, str] | None:
+    """Read fresh policy/binding; never repair or replace either one."""
+    owner = session_owner(address)
+    requirements = [delivery_requirement(name) for name in dict.fromkeys((address, owner))]
+    selected = None
+    for requirement in requirements:
+        if requirement is None:
+            continue
+        if requirement["session_owner"] != owner:
+            raise IAMError("delivery_session_owner_mismatch")
+        current = DeliveryState.load(iam.mailbox(owner) / ".codex-bridge-state.json").thread_id
+        if not current:
+            raise IAMError("delivery_thread_missing")
+        if current != requirement["thread_id"]:
+            raise IAMError("delivery_thread_mismatch")
+        if actual_thread is not None and actual_thread != requirement["thread_id"]:
+            raise IAMError("delivery_active_thread_mismatch")
+        selected = requirement
+    return selected
+
+
+async def activate_delivery(mailbox: SupervisorMailbox, url: str, *, required_thread: str | None = None) -> ActiveDelivery:
     """Attach one mailbox to its own client connection only when mail requires it."""
-    client = AppServerClient(url=url)
+    workspace_recorded = (iam.mailbox(mailbox.address) / ".session-workspace.json").exists()
+    client = appserver_client(url, experimental_api=True)
     try:
         await client.connect()
+        workspace = session_workspace(mailbox.address)
+        root = Path(registered_projects()[workspace]["project_root"]).resolve()
         bridge = MailboxBridge(
             mailbox.service,
             mailbox.state,
             client,
-            explicit_thread_id=mailbox.state.thread_id,
+            explicit_thread_id=required_thread or mailbox.state.thread_id,
             # A recorded mailbox thread is authoritative.  Never replace it
             # merely because a transient app-server failure makes it appear
             # unavailable; that destroys the user's chosen conversation.
-            create_thread=not bool(mailbox.state.thread_id),
+            create_thread=not bool(required_thread or mailbox.state.thread_id),
             sandbox=mailbox.sandbox,
             approval_policy=mailbox.approval_policy,
+            execution_root=root,
         )
         thread = await bridge.attach_thread()
-        await bridge.ensure_resumable(thread)
+        if workspace_recorded:
+            actual = await client.request(
+                "thread/resume",
+                thread_resume_params(
+                    str(thread["id"]),
+                    root,
+                    {"sandbox": mailbox.sandbox, "approval_policy": mailbox.approval_policy},
+                    runtime_workspace_roots=True,
+                ),
+            )
+            verify_session_workspace(actual, str(thread["id"]), root)
+        elif not required_thread:
+            await bridge.ensure_resumable(thread)
         LOG.info("Activated delivery for %s on isolated Codex connection and thread %s", mailbox.address, thread["id"])
         return ActiveDelivery(client=client, bridge=bridge)
     except BaseException:
@@ -725,50 +1015,137 @@ async def serve_once(url: str, *, poll_seconds: float = 2.0, run_once: bool = Fa
         raise AppServerError("No projects are registered; run `iam setup <project>` first")
     signature = registry_signature(projects)
     mailboxes = supervisor_mailboxes(projects)
+    by_address = {mailbox.address: mailbox for mailbox in mailboxes}
     active: dict[str, ActiveDelivery] = {}
+    retry_after: dict[str, float] = {}
+    retry_delay: dict[str, float] = {}
+    # Separate opt-in external attention lane. Never delays the mailbox scan
+    # awaiting verifier IO and never inherits mail retry/new-thread semantics.
+    from iam_fast_path import supervised_lane
+    fast_path_task = asyncio.create_task(supervised_lane(url, appserver_client, session_guard))
+
+    def defer(owner: str) -> float:
+        delay = min(max(retry_delay.get(owner, poll_seconds), poll_seconds) * 2, 60.0)
+        retry_delay[owner] = delay
+        retry_after[owner] = time.monotonic() + delay
+        return delay
+
+    def recovered(owner: str) -> None:
+        retry_after.pop(owner, None)
+        retry_delay.pop(owner, None)
+
     try:
         while True:
+            # An explicit iam open --thread-id may change a primary while
+            # this supervisor holds an older in-memory delivery state.
+            if registry_signature(registered_projects()) != signature or any(
+                DeliveryState.load(mailbox.state.path).thread_id != mailbox.state.thread_id
+                for mailbox in mailboxes
+            ):
+                LOG.info("Mailbox session configuration changed; reloading before delivery")
+                return
+            delivered_owners: set[str] = set()
             for mailbox in mailboxes:
-                session = active.get(mailbox.address)
-                pending = mailbox.pending_messages()
-                chat_state, pending_chat = mailbox.pending_chat()
-                pending_timers = mailbox.pending_timers()
-                if session is None:
-                    if not pending and not pending_chat and not pending_timers:
+                owner = session_owner(mailbox.address)
+                if owner in delivered_owners:
+                    continue
+                if time.monotonic() < retry_after.get(owner, 0):
+                    continue
+                with session_guard(owner, "workspace") as available:
+                    if not available:
+                        continue
+                    primary = by_address.get(owner)
+                    if primary is None:
+                        delay = defer(owner)
+                        LOG.error("Shared session owner %s is unavailable; mail stays queued (retry in %.0fs)", owner, delay)
                         continue
                     try:
-                        session = await activate_delivery(mailbox, url)
-                        active[mailbox.address] = session
-                    except (AppServerError, OSError, KeyError, ValueError) as exc:
-                        LOG.error("Could not activate delivery for %s: %s", mailbox.address, exc)
+                        requirement = check_delivery_requirement(mailbox.address)
+                    except (IAMError, OSError, ValueError) as exc:
+                        delay = defer(owner)
+                        LOG.warning("Delivery held for %s: %s (retry in %.0fs)", mailbox.address, exc, delay)
                         continue
+                    session = active.get(owner)
+                    try:
+                        workspace = session_workspace(owner)
+                        execution_root = Path(projects[workspace]["project_root"]).resolve()
+                    except (IAMError, KeyError, OSError, ValueError) as exc:
+                        delay = defer(owner)
+                        LOG.error("Shared workspace unavailable for %s: %s (retry in %.0fs)", owner, exc, delay)
+                        continue
+                    if session and session.bridge.execution_root != execution_root:
+                        await close_active_delivery(owner, session)
+                        active.pop(owner, None)
+                        session = None
+                    pending = mailbox.pending_messages()
+                    chat_state, pending_chat = mailbox.pending_chat()
+                    pending_timers = mailbox.pending_timers()
+                    # Heartbeats use their own acceptance/hold state, never mail's
+                    # activation/retry/thread-creation path. The workspace lock
+                    # above also serializes linked mailbox activations.
+                    if not pending and not pending_chat and not pending_timers:
+                        from iam_heartbeat import deliver_due
+                        if await deliver_due(owner, url, projects, appserver_client):
+                            delivered_owners.add(owner)
+                            continue
+                    if session is None:
+                        if not pending and not pending_chat and not pending_timers:
+                            continue
+                        try:
+                            if requirement:
+                                session = await activate_delivery(primary, url, required_thread=requirement["thread_id"])
+                            else:
+                                session = await activate_delivery(primary, url)
+                            active[owner] = session
+                        except (AppServerError, OSError, KeyError, ValueError) as exc:
+                            delay = defer(owner)
+                            LOG.error("Could not activate delivery for %s: %s (retry in %.0fs)", mailbox.address, exc, delay)
+                            continue
+                    recovered(owner)
 
-                try:
-                    if pending_timers:
-                        timer = pending_timers[0]
-                        if await session.bridge.deliver_timer(timer):
-                            mailbox.service.timer_mark_delivered(str(timer["id"]))
-                            LOG.info("Delivered timer %s for %s", timer["id"], mailbox.address)
+                    try:
+                        check_delivery_requirement(mailbox.address, session.bridge.thread_id)
+                        bridge = session.bridge if owner == mailbox.address else MailboxBridge(
+                            mailbox.service, mailbox.state, session.client,
+                            shared_thread_id=session.bridge.thread_id,
+                            execution_root=execution_root,
+                            sandbox=primary.sandbox, approval_policy=primary.approval_policy,
+                            policy_turn_ids=session.bridge.policy_turn_ids,
+                        )
+                        bridge.delivery_check = lambda address=mailbox.address, target=bridge.thread_id: check_delivery_requirement(address, target)
+                        if pending_timers:
+                            timer = pending_timers[0]
+                            if await bridge.deliver_timer(timer):
+                                delivered_owners.add(owner)
+                                mailbox.service.timer_mark_delivered(str(timer["id"]))
+                                LOG.info("Delivered timer %s for %s", timer["id"], mailbox.address)
+                                continue
+                        if chat_state and pending_chat:
+                            delivered_chat = await bridge.deliver_chat(chat_state["channel"], pending_chat[:10])
+                            if delivered_chat:
+                                delivered_owners.add(owner)
+                                mailbox.service.chat_mark_delivered(chat_state, pending_chat[:10])
+                                LOG.info("Delivered %d chat update(s) for %s", min(10, len(pending_chat)), mailbox.address)
+                                continue
+                        delivered = await bridge.deliver_once()
+                        if delivered:
+                            delivered_owners.add(owner)
+                            # A turn can still report idle immediately after turn/start; retain its
+                            # isolated connection until at least the following supervisor pass.
                             continue
-                    if chat_state and pending_chat:
-                        delivered_chat = await session.bridge.deliver_chat(chat_state["channel"], pending_chat[:10])
-                        if delivered_chat:
-                            mailbox.service.chat_mark_delivered(chat_state, pending_chat[:10])
-                            LOG.info("Delivered %d chat update(s) for %s", min(10, len(pending_chat)), mailbox.address)
-                            continue
-                    delivered = await session.bridge.deliver_once()
-                    if delivered:
-                        # A turn can still report idle immediately after turn/start; retain its
-                        # isolated connection until at least the following supervisor pass.
-                        continue
-                    _chat_state, remaining_chat = mailbox.pending_chat()
-                    if not mailbox.pending_messages() and not remaining_chat and not mailbox.pending_timers() and await release_if_idle(session):
-                        await close_active_delivery(mailbox.address, session)
-                        active.pop(mailbox.address, None)
-                except (AppServerError, OSError, KeyError, ValueError) as exc:
-                    LOG.error("Delivery failed for %s: %s", mailbox.address, exc)
-                    await close_active_delivery(mailbox.address, session)
-                    active.pop(mailbox.address, None)
+                        _chat_state, remaining_chat = mailbox.pending_chat()
+                        group_pending = any(
+                            member.pending_messages() or member.pending_chat()[1] or member.pending_timers()
+                            for member in mailboxes if session_owner(member.address) == owner
+                        )
+                        if not group_pending and await release_if_idle(session):
+                            await close_active_delivery(owner, session)
+                            active.pop(owner, None)
+                    except (IAMError, AppServerError, OSError, KeyError, ValueError) as exc:
+                        delay = defer(owner)
+                        LOG.error("Delivery failed for %s: %s (retry in %.0fs)", mailbox.address, exc, delay)
+                        await close_active_delivery(owner, session)
+                        active.pop(owner, None)
 
             if registry_signature(registered_projects()) != signature:
                 LOG.info("Project registry changed; reloading")
@@ -777,6 +1154,8 @@ async def serve_once(url: str, *, poll_seconds: float = 2.0, run_once: bool = Fa
                 return
             await asyncio.sleep(poll_seconds)
     finally:
+        fast_path_task.cancel()
+        await asyncio.gather(fast_path_task, return_exceptions=True)
         for address, session in list(active.items()):
             await close_active_delivery(address, session)
 
@@ -854,6 +1233,8 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "doctor": {"json": True, "project_filter": True},
             "user": {"json": True, "mailbox_kind": "user"},
             "web": {"json": True, "standalone_process": True, "authentication_required": True},
+            "hooks": {"preview": True, "wire_schema": "1.0", "standalone_process": True,
+                      "loopback_only": True, "agent_execution": False},
         },
         "features": {
             "collision_detection": True,
@@ -868,6 +1249,7 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
             "lazy_isolated_delivery_connections": True,
             "urgent_mail_steering": True,
             "web_managed_by_iam_service": False,
+            "generic_hooks_preview": True,
         },
     }
     if getattr(args, "json_output", False):
@@ -1250,20 +1632,51 @@ def cmd_connect_removeuser(args: argparse.Namespace) -> int:
     return 0
 
 
+def check_connector_installation() -> None:
+    """Probe fresh-process imports without checkout/PYTHONPATH masking defects.
+
+    Imports only: no connector, database, thread or network session is started.
+    Keep failures body-free; subprocess stderr may contain local configuration.
+    """
+    probe = (
+        "import iam_webconnect, iam_desktop, iam_messenger_reads, "
+        "iam_messenger_stream, iam_messenger_connector, iam_messenger_pairing"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", probe],
+            capture_output=True, text=True, timeout=30,
+            **background_process_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise IAMCommandError(
+            "IAM_CONNECT_INSTALLATION_CHECK_FAILED",
+            "Could not verify installed connector modules. No connector was launched; check the IAM installation.",
+            recoverable=True,
+        ) from None
+    if result.returncode:
+        raise IAMCommandError(
+            "IAM_CONNECT_INSTALLATION_INCOMPLETE",
+            "Installed connector imports failed. Refresh the IAM installation and verify imports outside the checkout. No connector was launched.",
+            recoverable=True,
+        )
+
+
 def cmd_connect_start(args: argparse.Namespace) -> int:
     try:
         config = load_webconnect_config()
     except WebConnectError as exc:
         raise IAMCommandError("IAM_CONNECT_NOT_CONFIGURED", str(exc), recoverable=True) from None
+    pid = read_pid("connect")
+    if pid_alive(pid):
+        print(f"WebConnect process is already running (pid {pid}); relay connectivity is not verified.")
+        return 0
+    check_connector_installation()
     if not config["enabled"]:
         config["enabled"] = True
         save_webconnect_config(config)
-    pid = read_pid("connect")
-    if pid_alive(pid):
-        print(f"WebConnect client is already running (pid {pid}).")
-        return 0
     pid = spawn_background([sys.executable, "-m", "iam_webconnect"], "connect")
-    print(f"WebConnect client started (pid {pid}) for {config['server_url']}.")
+    print(f"WebConnect process launched (pid {pid}) for {config['server_url']}; relay registration is not yet verified.")
     return 0
 
 
@@ -1276,6 +1689,11 @@ def cmd_connect_status(args: argparse.Namespace) -> int:
     pid = read_pid("connect")
     status = "running" if pid_alive(pid) else ("stopped" if config["enabled"] else "disabled")
     print(f"WebConnect: {status}")
+    from iam_webconnect import connector_health
+    health = connector_health(config, pid, status == 'running')
+    description = 'registered connection; recent relay pong verified' if health == 'ready' else health
+    print(f"Connection: {description}")
+    print("Delivery:   not verified by connection health; agent replies are separate")
     print(f"Server:     {config['server_url']}")
     print(f"Node:       {config['node_id']}")
     print(f"Humans:     {', '.join(config['human_mailboxes'])}")
@@ -1309,23 +1727,23 @@ def cmd_start(args: argparse.Namespace) -> None:
     print(f"Codex app-server: {ensure_appserver(args.url)}")
     print(f"IAM supervisor:   {ensure_daemon(args.url)}")
     print("Mail delivery is now running in the background for every registered project.")
+    from iam_desktop import enabled as desktop_enabled, start_desktop
+    if desktop_enabled():
+        print(f"IAM desktop:      {start_desktop()}")
 
 
 async def thread_available(url: str, thread_id: str, project_root: Path) -> bool:
-    client = AppServerClient(url=url, request_timeout=2.0)
+    client = appserver_client(url, request_timeout=30.0)
     try:
         await client.connect()
-        await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
-        listed = await client.request(
-            "thread/list",
-            {
-                "cwd": str(project_root),
-                "limit": 100,
-                "sortKey": "recency_at",
-                "sortDirection": "desc",
-            },
-        )
-        return any(str(item.get("id")) == thread_id for item in listed.get("data", []))
+        result = await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+        thread = result.get("thread", {})
+        # Validate this exact thread's project, not membership in a slow,
+        # filtered and paginated list of recent sessions.
+        cwd = thread.get("cwd")
+        return (str(thread.get("id")) == thread_id
+                and isinstance(cwd, str) and bool(cwd)
+                and Path(cwd).resolve() == project_root.resolve())
     except (AppServerError, OSError):
         return False
     finally:
@@ -1342,6 +1760,7 @@ def command_version(executable: str) -> tuple[str | None, str | None]:
             text=True,
             timeout=5,
             check=False,
+            **background_process_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return None, str(exc)
@@ -1868,6 +2287,314 @@ def wait_for_thread(address: str, url: str, project_root: Path, timeout: float =
     raise SystemExit(f"No Codex thread was created for {address}. See {log_path('supervisor')}")
 
 
+def cmd_email(args: argparse.Namespace) -> None:
+    from iam_service import mailbox_service
+    from iam_webconnect import email_registration
+    selected = mailbox_service(os.environ.get("IAM_PROJECT_ROOT") or Path.cwd(), args.mailbox)
+    print(json.dumps(email_registration(selected, args.action, args.local), indent=2))
+
+
+def cmd_fast_path(args: argparse.Namespace) -> None:
+    from iam_fast_path import configuration, configurations, registration_directory, register, set_enabled, public_config, Ledger
+    selected = project_entry(args.project)[0] if args.project else None
+    if selected is None and args.action in {"enable", "disable"}:
+        selected = project_entry(str(Path.cwd()))[0]
+    cfg = configuration(selected) if selected else configuration()
+    if args.action == "register":
+        if not args.resident or not args.verifier_url:
+            raise IAMError("Registration requires --resident and --verifier-url; no secrets on the command line")
+        address, _root, _entry = project_entry(args.project or str(Path.cwd()))
+        owner = session_owner(address)
+        root = Path(registered_projects()[session_workspace(owner)]["project_root"]).resolve()
+        thread_id = DeliveryState.load(iam.mailbox(owner) / ".codex-bridge-state.json").thread_id
+        with session_guard(owner, "workspace") as acquired:
+            if not acquired or not thread_id or not asyncio.run(thread_available(configured_endpoint(), thread_id, root)):
+                raise IAMError("Cannot verify the existing pinned session; no registration created")
+            with session_guard("fast-path", "registration") as registration_lock:
+                if not registration_lock:
+                    raise IAMError("Another fast-path registration is in progress")
+                result = register(mailbox=address, owner=owner, root=root, thread_id=thread_id,
+                                  resident=args.resident, verifier_url=args.verifier_url, listen_port=args.port)
+        print(json.dumps(result, indent=2))
+        print(f"Disabled registration created. Private handoff: {registration_directory(result) / 'credentials.json'}. Never transfer through mail. No grant or wake was enabled.")
+        return
+    if args.action in {"enable", "disable"}:
+        if cfg is None:
+            raise IAMError("No fast-path registration exists")
+        if args.action == "enable":
+            # Validate current binding without briefly enabling a live listener.
+            from iam_service import session_workspace as workspace
+            if (session_owner(cfg["mailbox"]) != cfg["owner"] or
+                DeliveryState.load(iam.mailbox(cfg["owner"]) / ".codex-bridge-state.json").thread_id != cfg["threadBinding"] or
+                Path(registered_projects()[workspace(cfg["owner"])]["project_root"]).resolve() != Path(cfg["root"]).resolve()):
+                raise IAMError("Fast-path registration no longer matches the current session")
+        result = set_enabled(args.action == "enable", selected)
+        print(json.dumps(result, indent=2))
+        print("Restart only the IAM supervisor to load listener changes. This does not enable any cDiscord attention record.")
+        return
+    rows = [cfg] if selected and cfg else ([] if selected else configurations())
+    print(json.dumps({"registrations": [{"registration": public_config(item),
+                      "private_handoff_directory": str(registration_directory(item)),
+                      "deliveries": Ledger(registration_directory(item) / "deliveries.sqlite3").summary()}
+                     for item in rows], "steering_available": False}, indent=2))
+
+
+def cmd_heartbeat(args: argparse.Namespace) -> None:
+    from iam_heartbeat import Heartbeats
+    address, root, _entry = project_entry(args.project or str(Path.cwd()))
+    store = Heartbeats()
+    if args.action == "status":
+        result = store.state(address)
+    elif args.action == "history":
+        result = store.history(address)
+    elif args.action == "resolve":
+        from iam_heartbeat import reconcile, release_with_receipt, reviewer_identity
+        if not args.delivery_id or not args.resolution or not args.verified_by:
+            raise IAMError("Resolution requires --delivery-id, --resolution and --verified-by; no blind retry")
+        actor = reviewer_identity(args.verified_by)
+        owner = session_owner(address)
+        with session_guard(owner, "workspace") as acquired:
+            if not acquired:
+                raise IAMError("Session delivery is busy; resolve during an idle window")
+            if args.resolution == "accepted":
+                result = asyncio.run(reconcile(owner, configured_endpoint(), appserver_client,
+                    delivery_id=args.delivery_id,
+                    actor=actor, turn_id=args.turn_id))
+                if not result:
+                    raise IAMError("Acceptance could not be verified in thread history; heartbeat hold remains")
+            else:
+                if not args.evidence_file:
+                    raise IAMError("Retry release requires --evidence-file with a verified protocol rejection receipt")
+                # Positive acceptance wins over a contradictory supplied rejection.
+                result = asyncio.run(reconcile(owner, configured_endpoint(), appserver_client,
+                    delivery_id=args.delivery_id,
+                    actor=actor))
+                if not result:
+                    result = release_with_receipt(address, args.delivery_id, args.evidence_file, args.verified_by)
+    elif args.action == "note":
+        if not args.message or not args.sender:
+            raise IAMError("Use --message and --from-name for an owner heartbeat note")
+        result = store.owner_note(address, args.message, args.sender)
+    elif args.action == "clear-note":
+        result = store.owner_note(address)
+    else:
+        owner = session_owner(address)
+        thread_id = DeliveryState.load(iam.mailbox(owner) / ".codex-bridge-state.json").thread_id
+        if args.action == "enable":
+            primary_root = Path(registered_projects()[session_workspace(owner)]["project_root"])
+            if not thread_id or not asyncio.run(thread_available(configured_endpoint(), thread_id, primary_root)):
+                raise IAMError("Cannot enable heartbeat: existing pinned thread could not be verified. No thread was created.")
+        result = store.configure(address, args.action, thread_id)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_session(args: argparse.Namespace) -> None:
+    address, _root, _entry = project_entry(args.project or str(Path.cwd()))
+    if args.session_command in {"require-existing", "allow-replacement"}:
+        owner = session_owner(address)
+        with session_guard(owner, "workspace") as available:
+            if not available:
+                raise IAMError("Session delivery is busy; retry shortly")
+            path = iam.mailbox(address) / ".delivery-requirement.json"
+            if args.session_command == "allow-replacement":
+                if path.exists():
+                    path.unlink()
+                print(f"Removed {address}'s delivery requirement; ordinary session selection applies.")
+                return
+            if args.session_owner and args.session_owner != owner:
+                raise IAMError("Expected session owner does not match the current owner")
+            current = DeliveryState.load(iam.mailbox(owner) / ".codex-bridge-state.json").thread_id
+            if not current or current != args.thread_id:
+                raise IAMError("An existing matching pinned thread is required; binding left unchanged")
+            iam.write_atomic(path, {"session_owner": owner, "thread_id": current})
+            print(f"{address}: delivery requires existing session {owner}/{current}; binding left unchanged.")
+            return
+    config = load_config()
+    links = config.setdefault("session_mailboxes", {})
+    if args.session_command == "link":
+        owner, _owner_root, _owner_entry = project_entry(args.primary)
+        if address == owner or owner in links or address in links.values():
+            raise IAMError("Cannot link a primary with members, link to a secondary, or link to itself")
+        if address in links and links[address] != owner:
+            raise IAMError("Unlink this mailbox before choosing another primary")
+        links[address] = owner
+        session_owner(address, config)
+        save_config(config)
+        print(f"{address} now shares {owner}'s session and execution settings. Mail stays separate.")
+    elif args.session_command == "unlink":
+        if address not in links:
+            raise IAMError("This project is not a secondary mailbox")
+        links.pop(address)
+        save_config(config)
+        print(f"Unlinked {address}. Its previous independent thread binding is retained; use iam open --thread-id to change it.")
+    else:
+        owner = session_owner(address, config)
+        members = [name for name in config.get("projects", {}) if session_owner(name, config) == owner]
+        print(f"Primary: {owner}; mailboxes: {', '.join(sorted(members))}")
+
+
+@contextmanager
+def session_guard(owner: str, purpose: str):
+    """OS-held locks survive process crashes without stale PID ownership guesses."""
+    directory = runtime_dir() / "shared-sessions"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{iam.safe_segment(owner, 'mailbox')}.{purpose}.lock"
+    with path.open("a+b") as handle:
+        handle.seek(0, 2)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        acquired = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except OSError:
+            pass
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def thread_resume_params(
+    thread_id: str,
+    root: Path,
+    entry: dict[str, Any],
+    *,
+    runtime_workspace_roots: bool = False,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "threadId": thread_id,
+        "cwd": str(root),
+        "excludeTurns": True,
+    }
+    if runtime_workspace_roots:
+        params["runtimeWorkspaceRoots"] = [str(root)]
+    return params
+
+
+async def apply_thread_policy(
+    url: str,
+    thread_id: str,
+    root: Path,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Resume a thread with its registered unattended policy before opening a terminal."""
+    client = appserver_client(url)
+    try:
+        await client.connect()
+        result = await client.request("thread/resume", thread_resume_params(thread_id, root, entry))
+        if str(result.get("thread", {}).get("id", "")) != thread_id:
+            raise IAMError("App-server did not confirm the requested thread; no terminal was opened")
+        return await apply_registered_thread_policy(
+            client,
+            thread_id,
+            str(entry.get("sandbox", "workspace-write")),
+            str(entry.get("approval_policy", "on-request")),
+            root,
+        )
+    except AppServerError as exc:
+        raise IAMError(
+            f"Could not apply the registered approval and sandbox policy to thread {thread_id}: {exc}. "
+            "No terminal was opened and the IAM binding was left unchanged."
+        ) from None
+    finally:
+        await client.close()
+
+
+async def switch_session_workspace(client: AppServerClient, thread_id: str, root: Path, entry: dict[str, Any]) -> None:
+    """Change actual runtime cwd, workspace roots, and policy; never start a model turn."""
+    result = await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+    status = result["thread"].get("status", {}).get("type")
+    if status not in {"idle", "notLoaded"}:
+        raise IAMError("Shared session is busy or awaiting approval; wait for its turn to finish")
+    confirmed = await client.request(
+        "thread/resume",
+        thread_resume_params(thread_id, root, entry, runtime_workspace_roots=True),
+    )
+    if confirmed["thread"].get("status", {}).get("type") != "idle":
+        raise IAMError("Shared session is not idle; workspace was not switched")
+    verify_session_workspace(confirmed, thread_id, root)
+    await apply_registered_thread_policy(
+        client,
+        thread_id,
+        str(entry.get("sandbox", "workspace-write")),
+        str(entry.get("approval_policy", "on-request")),
+        root,
+    )
+
+
+def verify_session_workspace(confirmed: dict[str, Any], thread_id: str, root: Path) -> None:
+    roots = confirmed.get("runtimeWorkspaceRoots")
+    if (confirmed.get("thread", {}).get("id") != thread_id
+            or not confirmed.get("cwd") or Path(confirmed["cwd"]).resolve() != root
+            or not isinstance(roots, list) or [Path(p).resolve() for p in roots] != [root]):
+        raise IAMError("App-server did not confirm the requested cwd and workspace roots; shared delivery remains paused")
+
+
+def cmd_open_shared(args: argparse.Namespace, address: str, root: Path, owner: str) -> None:
+    entry = registered_projects()[owner]
+    state = DeliveryState.load(iam.mailbox(owner) / ".codex-bridge-state.json")
+    requested = getattr(args, "thread_id", None)
+    if requested and address != owner:
+        raise IAMError("Change the shared thread from the primary project, not a secondary mailbox")
+    thread_id = requested or state.thread_id
+    if not thread_id:
+        raise IAMError("Pin an existing thread from the primary with iam open --thread-id before opening a shared workspace")
+    with session_guard(owner, "terminal") as terminal:
+        if not terminal:
+            raise IAMError("This shared session already has an IAM terminal open; exit it before opening another workspace")
+        with session_guard(owner, "workspace") as switching:
+            if not switching:
+                raise IAMError("Shared-session delivery or a workspace switch is in progress; retry shortly")
+            ensure_appserver(args.url)
+            marker = iam.mailbox(owner) / ".session-workspace.json"
+
+            async def switch():
+                client = appserver_client(args.url, experimental_api=True)
+                try:
+                    await client.connect()
+                    # Do not quarantine a busy thread: its current workspace is still valid.
+                    read = await client.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+                    if read["thread"].get("status", {}).get("type") not in {"idle", "notLoaded"}:
+                        raise IAMError("Shared session is busy or awaiting approval; wait for its turn to finish")
+                    iam.write_atomic(marker, {"mailbox": address, "verified": False})
+                    await switch_session_workspace(client, thread_id, root, entry)
+                    iam.write_atomic(marker, {"mailbox": address, "verified": True})
+                except AppServerError as exc:
+                    raise IAMError(f"Could not verify the shared workspace: {exc}. No terminal was opened; retry after resolving the app-server error.") from None
+                finally:
+                    await client.close()
+
+            asyncio.run(switch())
+            if requested:
+                state.thread_id = requested
+                state.save()
+        ensure_daemon(args.url)
+        command = [codex_executable(), "resume"]
+        if not is_managed_endpoint(args.url):
+            command.extend(["--remote", args.url, "--disable", "daemon_auto_start"])
+        else:
+            command.extend(["-s", str(entry.get("sandbox", "workspace-write")),
+                            "-a", str(entry.get("approval_policy", "on-request"))])
+        # Remote resume rejects permission CLI overrides; the workspace switch
+        # above already supplies the primary's policy through thread/resume.
+        command.extend(["-C", str(root), "--include-non-interactive", thread_id])
+        print(f"Opening {owner}'s shared session in {root}; mailbox identities remain separate.")
+        raise SystemExit(subprocess.run(command, cwd=str(root), check=False).returncode)
+
+
 def cmd_open(args: argparse.Namespace) -> None:
     root_value = args.project or str(Path.cwd())
     try:
@@ -1875,16 +2602,22 @@ def cmd_open(args: argparse.Namespace) -> None:
     except SystemExit:
         setup_project(root_value)
         address, root, entry = project_entry(root_value)
+    owner = session_owner(address)
+    links = load_config().get("session_mailboxes", {})
+    if address in links or address in links.values():
+        return cmd_open_shared(args, address, root, owner)
     ensure_appserver(args.url)
     ensure_daemon(args.url)
     state = DeliveryState.load(iam.mailbox(address) / ".codex-bridge-state.json")
-    command = [
-        codex_executable(),
-        "--remote", args.url,
+    base_command = [codex_executable()]
+    if not is_managed_endpoint(args.url):
+        base_command.extend(["--remote", args.url, "--disable", "daemon_auto_start"])
+    base_command.extend([
         "-C", str(root),
         "-s", str(entry.get("sandbox", "workspace-write")),
         "-a", str(entry.get("approval_policy", "on-request")),
-    ]
+    ])
+    command = base_command
     requested_thread_id = getattr(args, "thread_id", None)
     if requested_thread_id:
         if not asyncio.run(thread_available(args.url, requested_thread_id, root)):
@@ -1892,18 +2625,26 @@ def cmd_open(args: argparse.Namespace) -> None:
                 f"Codex thread {requested_thread_id} is not available for {root}. "
                 "The existing IAM thread binding was left unchanged."
             )
-        if state.thread_id != requested_thread_id:
-            state.thread_id = requested_thread_id
-            state.save()
-            print(f"Pinned {address} to explicitly selected Codex thread {requested_thread_id}.")
         thread_id = requested_thread_id
     elif state.thread_id:
         thread_id = wait_for_thread(address, args.url, root)
-        command[1:1] = ["resume"]
-        command.extend(["--include-non-interactive", thread_id])
-    if requested_thread_id:
-        command[1:1] = ["resume"]
-        command.extend(["--include-non-interactive", thread_id])
+    else:
+        thread_id = None
+    if thread_id:
+        asyncio.run(apply_thread_policy(args.url, thread_id, root, entry))
+        if requested_thread_id and state.thread_id != requested_thread_id:
+            state.thread_id = requested_thread_id
+            state.save()
+            print(f"Pinned {address} to explicitly selected Codex thread {requested_thread_id}.")
+        command = [codex_executable(), "resume"]
+        if not is_managed_endpoint(args.url):
+            command.extend(["--remote", args.url, "--disable", "daemon_auto_start"])
+        else:
+            command.extend(["-s", str(entry.get("sandbox", "workspace-write")),
+                            "-a", str(entry.get("approval_policy", "on-request"))])
+        # Remote resume must use the server-side policy applied above, not
+        # CLI overrides (which Codex explicitly rejects for remote tasks).
+        command.extend(["-C", str(root), "--include-non-interactive", thread_id])
     raise SystemExit(subprocess.run(command, check=False).returncode)
 
 
@@ -1922,12 +2663,17 @@ def collect_status(url: str = DEFAULT_URL) -> dict[str, Any]:
             project_rows.append({"address": address, "status": "invalid"})
             continue
         try:
-            state = DeliveryState.load(iam.mailbox(address) / ".codex-bridge-state.json")
+            state = DeliveryState.load(iam.mailbox(session_owner(address)) / ".codex-bridge-state.json")
             thread_state = "pinned" if state.thread_id else "pending"
             thread_id = state.thread_id
         except (OSError, ValueError):
             thread_state = "invalid"
             thread_id = None
+        try:
+            requirement = check_delivery_requirement(address)
+            delivery_policy = {"state": "ready" if requirement else "unrestricted", "requirement": requirement}
+        except (IAMError, OSError, ValueError) as exc:
+            delivery_policy = {"state": "held", "reason": str(exc)}
         project_rows.append({
             "address": address,
             "display_name": iam.display_name(address),
@@ -1936,6 +2682,8 @@ def collect_status(url: str = DEFAULT_URL) -> dict[str, Any]:
             "approval_policy": str(entry.get("approval_policy", "on-request")),
             "thread_state": thread_state,
             "thread_id": thread_id,
+            "session_owner": session_owner(address),
+            "delivery_policy": delivery_policy,
         })
     return {
         "services": {
@@ -1976,63 +2724,129 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  {project['address']}: invalid registration")
         else:
             print(f"  {project['address']}: {project['project_root']} (thread {project['thread_id'] or 'pending'})")
+            if project["delivery_policy"]["state"] == "held":
+                print(f"    Delivery held: {project['delivery_policy']['reason']}")
     return 0
 
 
 def stop_process(pid: int, *, tree: bool = False) -> None:
     if os.name == "nt" and tree:
-        subprocess.run(
+        completed = subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
             check=False,
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
-        return
-    os.kill(pid, signal.SIGTERM)
+        if completed.returncode != 0 and pid_alive(pid):
+            detail = (completed.stderr or completed.stdout or "taskkill failed").strip()
+            raise IAMCommandError(
+                "IAM_PROCESS_STOP_FAILED",
+                f"Could not stop process tree {pid}: {detail}",
+                recoverable=True,
+                details={"pid": pid},
+            )
+    else:
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 2.0
+    while pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if pid_alive(pid):
+        raise IAMCommandError(
+            "IAM_PROCESS_STOP_FAILED",
+            f"Process {pid} did not exit after it was asked to stop.",
+            recoverable=True,
+            details={"pid": pid},
+        )
+
+
+def wait_compatibility_port_release(url: str, *, wait_seconds: float = 10.0) -> None:
+    """Launcher exit alone does not prove Windows released its listening socket."""
+    deadline = time.monotonic() + wait_seconds
+    while not compatibility_port_available(url):
+        if time.monotonic() >= deadline:
+            raise IAMCommandError(
+                "IAM_APPSERVER_SHUTDOWN_INCOMPLETE",
+                f"Codex shutdown is incomplete: {url} is still occupied after "
+                f"{wait_seconds:g} seconds. No replacement was launched; ownership "
+                "records were preserved. Inspect the port owner and app-server log "
+                "before retrying. Do not stop an unverified process.",
+                recoverable=True,
+                details={"endpoint": url, "recorded_pid": read_pid("app-server")},
+            )
+        time.sleep(0.25)
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
+    from iam_desktop import control as desktop_control
+    if desktop_control('stop'):
+        print('Stopped IAM desktop companion.')
     pid = read_pid("supervisor")
     if pid_alive(pid):
         assert pid is not None
-        stop_process(pid)
+        stop_process(pid, tree=os.name == "nt")
         print(f"Stopped IAM supervisor process {pid}.")
     else:
         print("IAM supervisor is not running.")
     if args.all:
+        endpoint = configured_endpoint()
+        compatibility = load_config().get("windows_hidden_console_port") is not None
         server_pid = read_pid("app-server")
         if pid_alive(server_pid):
             assert server_pid is not None
             stop_process(server_pid, tree=True)
-            print(f"Stopped managed Codex app-server process tree {server_pid}.")
+            print(f"IAM-owned Codex app-server launcher {server_pid} exited.")
         else:
-            print("Managed Codex app-server is not running.")
+            print("No legacy IAM-owned Codex app-server is running.")
             try:
-                if asyncio.run(appserver_available(getattr(args, "url", DEFAULT_URL))):
+                if not is_managed_endpoint(endpoint) and asyncio.run(appserver_available(endpoint)):
                     print(
                         "An unmanaged Codex app-server is still reachable and was left running. "
                         "Stop it from the terminal that started it, or close that Codex process."
                     )
             except (OSError, RuntimeError, ValueError):
                 pass
+        if compatibility:
+            # Check even with a dead/missing launcher PID: an orphaned listener
+            # must not erase the remaining evidence or trigger a replacement.
+            wait_compatibility_port_release(endpoint)
+            print("Compatibility endpoint released.")
+        try:
+            pid_path("app-server", create=False).unlink()
+        except FileNotFoundError:
+            pass
     else:
-        print("The shared Codex app-server was left running. Use `iam stop --all` to stop it too.")
+        print("The shared Codex app-server was left running. `iam stop --all` stops IAM-owned servers, not the Codex-managed daemon.")
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
     cmd_stop(argparse.Namespace(all=True))
-    time.sleep(0.5)
     cmd_start(args)
 
 
 def cmd_daemon(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    log_file = getattr(args, "log_file", None)
+    if log_file:
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(message)s",
+            handlers=[handler],
+            force=True,
+        )
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     existing = read_pid("supervisor")
     if pid_alive(existing) and existing != os.getpid():
         raise SystemExit(f"IAM supervisor is already running (pid {existing}).")
     pid_path("supervisor").write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    LOG.info("IAM supervisor started on %s with pid %s", args.url, os.getpid())
     try:
         asyncio.run(daemon_loop(args.url))
     except KeyboardInterrupt:
@@ -2051,6 +2865,43 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--version", action="version", version=f"%(prog)s {package_version()}")
     sub = result.add_subparsers(dest="command", required=True)
+    from iam_desktop import command as desktop_command
+    desktop = sub.add_parser('desktop', help='Manage the optional local desktop buddy list.')
+    desktop.add_argument('action', choices=['enable', 'disable', 'start', 'stop', 'status', 'reply'])
+    desktop.add_argument('--request-id')
+    desktop_body = desktop.add_mutually_exclusive_group()
+    desktop_body.add_argument('--body', help='Single-line reply text; use --body-file for multiline text on Windows')
+    desktop_body.add_argument('--body-file', help='UTF-8 file containing the exact reply body (safe with Windows .cmd launchers)')
+    desktop.add_argument('--mailbox')
+    desktop.add_argument('--file', action='append', help='Explicit document attachment for desktop reply; repeat for multiple files')
+    desktop.add_argument('--image', action='append', help='Explicit PNG/JPEG/WebP attachment; repeat up to four images')
+    desktop.set_defaults(func=desktop_command)
+    email = sub.add_parser("email", help="Choose a mailbox-bound external email address after owner enrollment.")
+    email.add_argument("action", choices=["available", "register", "status"])
+    email.add_argument("local", nargs="?")
+    email.add_argument("--mailbox", help="Only the bound or explicitly linked mailbox may be selected.")
+    email.set_defaults(func=cmd_email)
+    fast_path = sub.add_parser("fast-path", help="Owner controls for disabled-by-default external attention delivery.")
+    fast_path.add_argument("action", choices=["register", "enable", "disable", "status"])
+    fast_path.add_argument("project", nargs="?")
+    fast_path.add_argument("--resident")
+    fast_path.add_argument("--verifier-url")
+    fast_path.add_argument("--port", type=int, default=43200)
+    fast_path.set_defaults(func=cmd_fast_path)
+
+    heartbeat = sub.add_parser("heartbeat", help="Owner controls for opt-in one-shot session heartbeats.")
+    heartbeat.add_argument("action", choices=["enable", "disable", "pause", "resume", "status", "note", "clear-note", "history", "resolve"])
+    heartbeat.add_argument("project", nargs="?")
+    heartbeat.add_argument("--message", help="One-time owner note for the next heartbeat; replaces any pending note.")
+    heartbeat.add_argument("--from-name", dest="sender", help="Owner's display name for the note.")
+    heartbeat.add_argument("--delivery-id", help="Exact held delivery to resolve.")
+    heartbeat.add_argument("--resolution", choices=["accepted", "retry"])
+    heartbeat.add_argument("--verified-by", help="Identity of the human reviewing acceptance/rejection evidence.")
+    heartbeat.add_argument("--turn-id", help="Optional known turn ID to constrain acceptance verification.")
+    heartbeat.add_argument("--evidence-file", help="Body-free, correlated protocol rejection receipt; never a timeout or missing-history assertion.")
+    heartbeat.set_defaults(func=cmd_heartbeat)
+    from iam_hooks import add_parser as add_hooks_parser
+    add_hooks_parser(sub)
 
     capabilities = sub.add_parser("capabilities", help="Describe IAM's stable automation interface.")
     capabilities.add_argument("--json", action="store_true", dest="json_output")
@@ -2151,16 +3002,33 @@ def parser() -> argparse.ArgumentParser:
     unregister.add_argument("--json", action="store_true", dest="json_output")
     unregister.set_defaults(func=cmd_unregister)
 
-    start = sub.add_parser("start", help="Start the shared app-server and mail supervisor in the background.")
-    start.add_argument("--url", default=DEFAULT_URL)
+    session = sub.add_parser("session", help="Manage explicit shared-session mailboxes (local administrator only).")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    for action in ("link", "unlink", "show", "require-existing", "allow-replacement"):
+        command = session_sub.add_parser(action)
+        command.add_argument("project", nargs="?", help="Registered project folder; defaults to the current directory.")
+        if action == "link":
+            command.add_argument("--primary", required=True, help="Registered project folder that owns the shared session.")
+        if action == "require-existing":
+            command.add_argument("--thread-id", required=True, help="Exact already-pinned thread required for delivery.")
+            command.add_argument("--session-owner", help="Assert the effective primary mailbox address.")
+        command.set_defaults(func=cmd_session)
+
+    start = sub.add_parser("start", help="Start the Codex managed daemon and mail supervisor in the background.")
+    start.add_argument("--url", default=DEFAULT_URL, help="Use managed:// (default) or an explicit legacy ws:// endpoint.")
     start.set_defaults(func=cmd_start)
+
+    mode = sub.add_parser("app-server-mode", help="Choose managed or Windows hidden-console compatibility mode (services must be stopped).")
+    mode.add_argument("mode", choices=("managed", "hidden-console"))
+    mode.add_argument("--port", type=int, default=4500, help="Loopback-only compatibility port; default 4500.")
+    mode.set_defaults(func=cmd_app_server_mode)
 
     status = sub.add_parser("status", help="Show service and registered-project status.")
     status.add_argument("--url", default=DEFAULT_URL)
     status.add_argument("--json", action="store_true", dest="json_output")
     status.set_defaults(func=cmd_status)
 
-    restart = sub.add_parser("restart", help="Restart both background services without visible windows.")
+    restart = sub.add_parser("restart", help="Restart IAM delivery without opening visible windows.")
     restart.add_argument("--url", default=DEFAULT_URL)
     restart.set_defaults(func=cmd_restart)
 
@@ -2187,12 +3055,13 @@ def parser() -> argparse.ArgumentParser:
     report.add_argument("--log-lines", type=int, default=200, help="Trailing log lines to summarize without copying their contents.")
     report.set_defaults(func=cmd_report)
 
-    stop = sub.add_parser("stop", help="Stop automatic mail delivery but leave Codex app-server running.")
-    stop.add_argument("--all", action="store_true", help="Also stop the app-server started by IAM.")
+    stop = sub.add_parser("stop", help="Stop automatic mail delivery; leave the Codex managed daemon running.")
+    stop.add_argument("--all", action="store_true", help="Also stop an obsolete legacy app-server started by IAM.")
     stop.set_defaults(func=cmd_stop)
 
     daemon = sub.add_parser("serve", help="Run the mail supervisor in the foreground.")
     daemon.add_argument("--url", default=DEFAULT_URL)
+    daemon.add_argument("--log-file", help=argparse.SUPPRESS)
     daemon.set_defaults(func=cmd_daemon)
     return result
 
@@ -2200,7 +3069,16 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
+        # Resolve at invocation time, not import time; direct --url always wins.
+        supplied = sys.argv[1:] if argv is None else argv
+        if hasattr(args, "url") and not any(item == "--url" or item.startswith("--url=") for item in supplied):
+            args.url = configured_endpoint()
         result = args.func(args)
+    except IAMError as exc:
+        if not getattr(args, "json_output", False):
+            raise SystemExit(str(exc)) from None
+        print_json(integration_error(exc))
+        return 1
     except SystemExit as exc:
         if not getattr(args, "json_output", False):
             raise

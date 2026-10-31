@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'">
+<title>IAM Messenger</title><link rel="stylesheet" href="app.css"></head><body>
+<header><button id="backHome" hidden aria-label="Back to buddy list">Back</button><div id="profileHeader" hidden><span id="chatAvatar" aria-hidden="true"></span><img id="chatPortrait" hidden alt="Profile picture"></div><div id="headerIdentity"><h1 id="pageTitle">IAM Messenger</h1><div id="profileLines" hidden><small id="chatPresence"></small><small id="chatStatus"></small></div></div><div id="headerActions"><button id="connectionSettings" hidden aria-label="Connection settings">Settings</button><button id="openHelp" hidden>Help</button><small id="chatContext" hidden>Context unavailable</small></div></header>
+<main><div id="controls"><p id="status" role="status" aria-live="polite">Starting protected device storage…</p>
+<small id="liveStatus" role="status" aria-live="polite" hidden></small>
+<button id="openFriends" hidden>Friends and invitations</button>
+<button id="retryDevice" hidden>Retry device startup</button>
+<section id="login"><h2>Sign in</h2><form id="loginForm">
+<label>Messenger server (HTTPS)<input id="origin" type="url" value="https://iamwebconnect.cerberusgamelabs.xyz" required autocomplete="url"></label>
+<label>Email<input id="email" type="email" required autocomplete="username"></label>
+<label>Password<input id="password" type="password" required autocomplete="current-password"></label>
+<button type="submit">Sign in</button></form>
+<details id="accountHelp"><summary>Create account or recover access</summary>
+<p>Verified friend-only accounts are free; pilot admission still applies. Friendship requires an accepted invitation. Desktop linking is a separate owner-only permission, not a requirement for chatting with friends.</p>
+<form id="accountForm"><label>Account action<select id="accountAction"><option value="register">Create account</option><option value="verify">Verify email with code</option><option value="resend">Resend verification email</option><option value="forgot">Forgot password</option><option value="reset">Reset password with code</option></select></label>
+<label id="accountEmailField">Email<input id="accountEmail" type="email" maxlength="254" autocomplete="email" required></label>
+<label id="accountCodeField" hidden>Email code<input id="accountCode" maxlength="43" autocomplete="one-time-code" spellcheck="false" autocapitalize="none"></label>
+<label id="accountPasswordField">New password (12–256 characters)<input id="accountPassword" type="password" minlength="12" maxlength="256" autocomplete="new-password" required></label>
+<label id="accountConfirmField">Confirm password<input id="accountConfirm" type="password" minlength="12" maxlength="256" autocomplete="new-password" required></label>
+<p>Codes expire after 30 minutes. Resetting a password signs out existing account sessions and phones.</p>
+<button type="submit">Continue</button><p id="accountStatus" role="status" aria-live="polite"></p></form></details></section>
+<section id="paired" hidden><section id="buddyPanel"><h2>Buddy list</h2><label>Find a saved conversation<input id="buddySearch" type="search" autocomplete="off" placeholder="Name or installation"></label><p id="buddySummary"></p><p id="emptyBuddies" hidden>No linked conversations yet. Link your desktop to get started.</p><nav id="buddies" aria-label="Saved conversations"></nav><button id="addConversation">Link your desktop</button><p class="scope-note">Desktop linking grants owner access. Do not share your linking code with friends.</p></section><h2 id="activeConversation"></h2><details id="settings"><summary>Settings</summary><h2>Your desktop link</h2><details><summary>Account and device identity</summary><p id="identity"></p></details>
+<h3>Connect desktop</h3><p>On Desktop's buddy list choose Connect phone. Scan its QR or paste the full manual code here. Scanning does not approve access.</p>
+<button id="scanPairing">Scan Desktop QR</button><label>Manual pairing code<textarea id="pairingCode" maxlength="4096" spellcheck="false" autocapitalize="none"></textarea></label>
+<button id="claimPairing">Use pairing code</button><button id="checkAccountPairing">Check account pairing approval</button><p id="accountPairingStatus"></p>
+<details><summary>Advanced pairing recovery</summary><p>For recovery of an existing owner pairing only. To add approved agents, link your desktop above. This is not a friend invitation.</p>
+<label>Installation ID<input id="installation" maxlength="512" autocomplete="off"></label>
+<label>Conversation mailbox<input id="conversation" maxlength="512" autocomplete="off" placeholder="Exact mailbox approved on Desktop"></label>
+<p>Compare this SHA-256 key fingerprint with the trusted Desktop before approving:</p><pre id="fingerprint"></pre><p id="protection"></p>
+<button id="request">Request pairing</button><pre id="challenge"></pre>
+<button id="check">Check local approval</button><button id="history">Refresh / next page</button>
+<button id="renewPairing">Request fresh pairing for this conversation</button>
+</details>
+<button id="enableNotifications">Enable / refresh notifications for this conversation</button>
+<button id="logout">Sign out and erase local drafts</button>
+<p>Pairing is approved on your trusted desktop. Existing history is shared only if you choose it there. Tool approvals are not supported in this pilot.</p></details></section>
+ </div><section aria-label="Conversation history" id="messages" tabindex="0"></section></main>
+<section id="composer" hidden><div class="compose-row"><button id="pickImage" aria-label="Choose resized photo" title="Choose resized photo">+</button><button id="pickFile" aria-label="Choose original image or document" title="Choose original image or document">File</button><textarea id="draft" aria-label="Message" placeholder="Message" maxlength="2000" rows="1"></textarea><button id="send">Send</button></div>
+<div id="selectedPhoto" hidden><img id="photoPreview" hidden alt="Selected photo preview"><button id="removeImage" hidden>Remove photo</button></div>
+<div id="selectedFiles" hidden></div>
+<p id="connectionNotice" role="status" hidden></p><button id="pendingNotice" hidden>Pending send — review delivery</button></section>
+<dialog id="chatHelp" aria-labelledby="helpTitle"><h2 id="helpTitle">Conversation help</h2><button id="closeHelp" autofocus>Close help</button><button id="helpHome">Buddy list</button><button id="latest">Jump to newest</button><p id="helpStatus" role="status"></p>
+<details id="sendDetails" open><summary>Delivery details</summary><small id="count"></small><button id="checkSent">Recheck history and delivery</button>
+<p id="pending" role="status"></p><button id="recover" hidden>Check original send / recover safely</button><button id="clearPending" hidden>Dismiss reminder and keep text</button>
+<p>+ selects a resized JPEG copy. File shares original PNG/JPEG/WebP or supported documents, including their metadata: 4 MB each, four files and 8 MB per category. Interrupted uploads resume after checking the original message ID. Tool approvals remain on Desktop.</p></details></dialog>
+<dialog id="friendships" aria-label="Friends"></dialog>
+<dialog id="imageViewer"><button id="closeImage">Close image</button><button id="saveImage">Save image</button><img id="viewImage" alt="Shared conversation image"></dialog>
+<dialog id="textViewer" aria-labelledby="fullTextTitle"><h2 id="fullTextTitle">Full message</h2><button id="closeText" autofocus>Close full message</button><pre id="fullText"></pre></dialog>
+<script src="markdown.js"></script><script src="message-time.js"></script><script src="read-visible.js"></script><script type="module" src="app.mjs"></script></body></html>

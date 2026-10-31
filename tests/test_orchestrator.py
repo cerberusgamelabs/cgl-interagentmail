@@ -4,6 +4,8 @@ import asyncio
 import argparse
 import io
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -13,24 +15,34 @@ from unittest.mock import AsyncMock, patch
 
 import interagentmail as iam
 from iam_codex_bridge import AppServerError, DeliveryState
-from iam_service import IAMService
+from iam_service import IAMError, IAMService
 from iam_orchestrator import (
     CHECK_FAIL,
+    IAMCommandError,
     INTEGRATION_SCHEMA_VERSION,
+    MANAGED_ENDPOINT,
     MCP_BEGIN,
+    apply_thread_policy,
+    appserver_client,
+    cmd_open,
     cmd_start,
     cmd_report,
     collect_diagnostics,
+    command_version,
     configure_web,
     create_user_mailbox,
+    ensure_appserver,
     load_web_config,
     main,
+    mcp_python_executable,
     pid_alive,
     registered_projects,
+    repair_codex_daemon_state_acl,
     render_report,
     sanitize_report,
     serve_once,
     setup_project,
+    stop_process,
     unregister_project,
 )
 
@@ -71,6 +83,182 @@ class OrchestratorSetupTests(unittest.TestCase):
         self.assertEqual("project", iam.profile("ExampleProject")["kind"])
         self.assertEqual(str(self.project.resolve()), registered_projects()["ExampleProject"]["project_root"])
         self.assertEqual("Example Agent", iam.display_name("ExampleProject"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only MCP launcher")
+    def test_managed_mcp_uses_windowless_python(self) -> None:
+        executable = Path(mcp_python_executable())
+        self.assertEqual("pythonw.exe", executable.name.lower())
+        self.assertTrue(executable.is_file())
+
+        setup_project(self.project)
+        config_text = (self.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn("pythonw.exe", config_text.lower())
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only process termination")
+    def test_failed_taskkill_is_reported_instead_of_claiming_success(self) -> None:
+        with (
+            patch("iam_orchestrator.subprocess.run") as run,
+            patch("iam_orchestrator.pid_alive", return_value=True),
+        ):
+            run.return_value.returncode = 5
+            run.return_value.stdout = ""
+            run.return_value.stderr = "Access is denied."
+            with self.assertRaisesRegex(IAMCommandError, "Access is denied"):
+                stop_process(1234, tree=True)
+
+    def test_managed_endpoint_uses_cli_proxy(self) -> None:
+        with (
+            patch("iam_orchestrator.codex_executable", return_value="codex"),
+            patch("iam_orchestrator.AppServerClient") as client_type,
+        ):
+            appserver_client(MANAGED_ENDPOINT, request_timeout=7)
+
+        client_type.assert_called_once_with(
+            command=["codex", "app-server", "proxy"],
+            websocket_stdio=True,
+            request_timeout=7,
+            experimental_api=True,
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only daemon ACL repair")
+    def test_daemon_acl_repair_uses_private_current_user_dacl(self) -> None:
+        home = self.root / "profile"
+        state_dir = home / ".codex" / "app-server-daemon"
+        state_dir.mkdir(parents=True)
+        results = [
+            subprocess.CompletedProcess(["whoami"], 0, "desktop\\agent\n", ""),
+            subprocess.CompletedProcess(["icacls"], 0, "ok", ""),
+            subprocess.CompletedProcess(["icacls"], 0, "ok", ""),
+            subprocess.CompletedProcess(["icacls"], 0, "ok", ""),
+        ]
+        with (
+            patch("iam_orchestrator.Path.home", return_value=home),
+            patch("iam_orchestrator.subprocess.run", side_effect=results) as run,
+        ):
+            self.assertEqual(state_dir, repair_codex_daemon_state_acl())
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(["whoami"], commands[0])
+        self.assertEqual(["icacls", str(state_dir), "/reset"], commands[1])
+        self.assertIn("desktop\\agent:(OI)(CI)(F)", commands[2])
+        self.assertEqual(["icacls", str(state_dir), "/inheritance:r"], commands[3])
+
+    def test_managed_daemon_privacy_error_repairs_acl_and_retries(self) -> None:
+        failed = subprocess.CompletedProcess(
+            ["codex"],
+            1,
+            "",
+            "socket directory is not private to the current user",
+        )
+        started = subprocess.CompletedProcess(["codex"], 0, "", "")
+        with (
+            patch("iam_orchestrator.appserver_available", new=AsyncMock(side_effect=[False, True])),
+            patch("iam_orchestrator.codex_executable", return_value="codex"),
+            patch("iam_orchestrator.subprocess.run", side_effect=[failed, started]) as run,
+            patch("iam_orchestrator.repair_codex_daemon_state_acl", return_value=Path("daemon")) as repair,
+        ):
+            result = ensure_appserver(MANAGED_ENDPOINT, wait_seconds=1)
+
+        self.assertEqual("managed daemon started", result)
+        self.assertEqual(2, run.call_count)
+        repair.assert_called_once_with()
+
+    def test_open_managed_resume_preserves_unattended_policy_without_remote_override(self) -> None:
+        setup_project(self.project, sandbox="danger-full-access", approval_policy="never")
+        args = argparse.Namespace(project=str(self.project), url=MANAGED_ENDPOINT, thread_id="chosen-thread")
+        with (
+            patch("iam_orchestrator.ensure_appserver"),
+            patch("iam_orchestrator.ensure_daemon"),
+            patch("iam_orchestrator.thread_available", new_callable=AsyncMock, return_value=True),
+            patch("iam_orchestrator.apply_thread_policy", new_callable=AsyncMock) as apply_policy,
+            patch("iam_orchestrator.codex_executable", return_value="codex"),
+            patch("iam_orchestrator.subprocess.run") as run,
+            redirect_stdout(io.StringIO()),
+        ):
+            run.return_value.returncode = 0
+            with self.assertRaises(SystemExit):
+                cmd_open(args)
+
+        command = run.call_args.args[0]
+        self.assertNotIn("--remote", command)
+        self.assertEqual("resume", command[1])
+        self.assertEqual("danger-full-access", command[command.index("-s") + 1])
+        self.assertEqual("never", command[command.index("-a") + 1])
+        self.assertIn("chosen-thread", command)
+        apply_policy.assert_awaited_once()
+        state = DeliveryState.load(iam.mailbox("ExampleProject") / ".codex-bridge-state.json")
+        self.assertEqual("chosen-thread", state.thread_id)
+
+    def test_remote_resume_applies_server_policy_without_cli_permission_overrides(self) -> None:
+        setup_project(self.project, sandbox="danger-full-access", approval_policy="never")
+        args = argparse.Namespace(project=str(self.project), url="ws://127.0.0.1:4500", thread_id="chosen-thread")
+        with (
+            patch("iam_orchestrator.ensure_appserver"),
+            patch("iam_orchestrator.ensure_daemon"),
+            patch("iam_orchestrator.thread_available", new_callable=AsyncMock, return_value=True),
+            patch("iam_orchestrator.apply_thread_policy", new_callable=AsyncMock) as policy,
+            patch("iam_orchestrator.codex_executable", return_value="codex"),
+            patch("iam_orchestrator.subprocess.run") as run,
+            redirect_stdout(io.StringIO()),
+        ):
+            run.return_value.returncode = 0
+            with self.assertRaises(SystemExit):
+                cmd_open(args)
+        command = run.call_args.args[0]
+        self.assertEqual(args.url, command[command.index("--remote") + 1])
+        self.assertEqual("daemon_auto_start", command[command.index("--disable") + 1])
+        for flag in ("-s", "-a", "--sandbox", "--ask-for-approval", "--dangerously-bypass-approvals-and-sandbox"):
+            self.assertNotIn(flag, command)
+        policy.assert_awaited_once()
+        self.assertEqual("never", policy.await_args.args[3]["approval_policy"])
+        self.assertEqual("danger-full-access", policy.await_args.args[3]["sandbox"])
+
+    def test_remote_policy_uses_settings_update_then_verifies_effective_policy(self) -> None:
+        client = AsyncMock()
+        client.request.side_effect = [
+            {"thread": {"id": "chosen-thread", "status": {"type": "idle"}}},
+            {},
+            {"thread": {"id": "chosen-thread", "status": {"type": "idle"}},
+             "approvalPolicy": "never", "sandbox": {"type": "dangerFullAccess"}},
+        ]
+        entry = {"sandbox": "danger-full-access", "approval_policy": "never"}
+        with patch("iam_orchestrator.appserver_client", return_value=client):
+            result = asyncio.run(apply_thread_policy(
+                "ws://127.0.0.1:4500", "chosen-thread", self.project, entry))
+        calls = client.request.call_args_list
+        self.assertEqual(["thread/resume", "thread/settings/update", "thread/resume"],
+                         [call.args[0] for call in calls])
+        self.assertNotIn("sandbox", calls[0].args[1])
+        self.assertNotIn("approvalPolicy", calls[0].args[1])
+        self.assertEqual("dangerFullAccess", calls[1].args[1]["sandboxPolicy"]["type"])
+        self.assertEqual("never", calls[1].args[1]["approvalPolicy"])
+        self.assertEqual("dangerFullAccess", result["sandbox"]["type"])
+
+    def test_open_does_not_repin_or_launch_when_policy_application_fails(self) -> None:
+        setup_project(self.project, sandbox="danger-full-access", approval_policy="never")
+        state = DeliveryState.load(iam.mailbox("ExampleProject") / ".codex-bridge-state.json")
+        state.thread_id = "old-thread"
+        state.save()
+        args = argparse.Namespace(project=str(self.project), url=MANAGED_ENDPOINT, thread_id="chosen-thread")
+        with (
+            patch("iam_orchestrator.ensure_appserver"),
+            patch("iam_orchestrator.ensure_daemon"),
+            patch("iam_orchestrator.thread_available", new_callable=AsyncMock, return_value=True),
+            patch(
+                "iam_orchestrator.apply_thread_policy",
+                new_callable=AsyncMock,
+                side_effect=IAMError("policy rejected"),
+            ),
+            patch("iam_orchestrator.subprocess.run") as run,
+        ):
+            with self.assertRaisesRegex(IAMError, "policy rejected"):
+                cmd_open(args)
+
+        run.assert_not_called()
+        self.assertEqual(
+            "old-thread",
+            DeliveryState.load(iam.mailbox("ExampleProject") / ".codex-bridge-state.json").thread_id,
+        )
 
     def test_setup_rejects_user_mailbox_and_preserves_web_identity(self) -> None:
         create_user_mailbox("ExampleProject", "Human User")
@@ -193,6 +381,14 @@ class OrchestratorSetupTests(unittest.TestCase):
 
 
 class WindowsProcessTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows-only process flags")
+    def test_diagnostic_version_probe_is_headless(self):
+        with patch("iam_orchestrator.subprocess.run", return_value=
+                   subprocess.CompletedProcess(["codex", "--version"], 0, "codex-cli test\n", "")) as run:
+            self.assertEqual(("codex-cli test", None), command_version("codex"))
+        self.assertTrue(run.call_args.kwargs["creationflags"] & subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(subprocess.SW_HIDE, run.call_args.kwargs["startupinfo"].wShowWindow)
+
     class _Kernel32:
         def __init__(self, exit_code: int) -> None:
             self.exit_code = exit_code
@@ -558,6 +754,8 @@ class FakeSupervisorClient:
         self.closed = asyncio.Event()
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.created = False
+        self.approval_policy = "on-request"
+        self.sandbox_policy: dict[str, Any] = {"type": "workspaceWrite"}
         self.instances.append(self)
 
     async def connect(self) -> None:
@@ -580,12 +778,164 @@ class FakeSupervisorClient:
             return {"thread": {"id": "supervised-thread", "status": {"type": "idle"}}}
         if method == "thread/read":
             return {"thread": {"id": params["threadId"], "status": {"type": "idle"}}}
+        if method == "thread/settings/update":
+            self.approval_policy = params["approvalPolicy"]
+            self.sandbox_policy = params["sandboxPolicy"]
+            return {}
+        if method == "thread/resume":
+            return {"thread": {"id": params["threadId"], "status": {"type": "idle"}},
+                    "approvalPolicy": self.approval_policy, "sandbox": self.sandbox_policy}
         if method == "turn/start":
             return {"turn": {"id": "delivery-turn", "status": "inProgress"}}
         raise AssertionError(f"Unexpected method {method}")
 
 
 class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_mail_does_not_block_other_mailboxes(self):
+        other = self.root / "OtherProject"
+        other.mkdir()
+        setup_project(other)
+        self.baseline(self.project)
+        self.baseline(other)
+        broken = iam.mailbox("SupervisedProject") / "inbox" / "broken.json"
+        broken.write_text("{unfinished", encoding="utf-8")
+        message = IAMService(self.project).send(["OtherProject"], "Valid", "Deliver normally")
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient), self.assertLogs("interagentmail", level="WARNING"):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        saved = DeliveryState.load(iam.mailbox("OtherProject") / ".codex-bridge-state.json")
+        self.assertTrue(saved.is_delivered(message["id"]))
+        self.assertEqual("{unfinished", broken.read_text(encoding="utf-8"))
+        bad_state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        self.assertFalse(bad_state.is_delivered("broken"))
+
+    async def test_guard_rechecks_binding_after_async_thread_read(self):
+        path = iam.mailbox("SupervisedProject") / ".codex-bridge-state.json"
+        state = DeliveryState.load(path)
+        state.thread_id = "expected"
+        state.save()
+        iam.write_atomic(iam.mailbox("SupervisedProject") / ".delivery-requirement.json",
+                         {"session_owner": "SupervisedProject", "thread_id": "expected"})
+        message = IAMService(self.project).send(["SupervisedProject"], "Wake", "Fixed notice")
+        class Changing(FakeSupervisorClient):
+            async def request(self, method, params):
+                result = await super().request(method, params)
+                if method == "thread/read" and sum(m == method for m, _ in self.calls) == 2:
+                    saved = DeliveryState.load(path)
+                    saved.thread_id = None
+                    saved.save()
+                return result
+        with patch("iam_orchestrator.AppServerClient", Changing):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        self.assertFalse(any(method in {"thread/start", "turn/start", "turn/steer"}
+                             for client in FakeSupervisorClient.instances for method, _ in client.calls))
+        self.assertFalse(DeliveryState.load(path).is_delivered(message["id"]))
+
+    async def test_guarded_missing_or_changed_pin_never_activates_or_consumes(self):
+        path = iam.mailbox("SupervisedProject") / ".codex-bridge-state.json"
+        iam.write_atomic(iam.mailbox("SupervisedProject") / ".delivery-requirement.json",
+                         {"session_owner": "SupervisedProject", "thread_id": "expected"})
+        message = IAMService(self.project).send(["SupervisedProject"], "Wake", "Fixed notice")
+        for pin in (None, "different"):
+            state = DeliveryState.load(path)
+            state.thread_id = pin
+            state.save()
+            with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient):
+                await serve_once("ws://127.0.0.1:4500", run_once=True)
+            self.assertEqual([], FakeSupervisorClient.instances)
+            saved = DeliveryState.load(path)
+            self.assertEqual(pin, saved.thread_id)
+            self.assertFalse(saved.is_delivered(message["id"]))
+
+    async def test_guarded_self_mail_uses_only_expected_thread_without_bootstrap(self):
+        path = iam.mailbox("SupervisedProject") / ".codex-bridge-state.json"
+        state = DeliveryState.load(path)
+        state.thread_id = "expected"
+        state.save()
+        iam.write_atomic(iam.mailbox("SupervisedProject") / ".delivery-requirement.json",
+                         {"session_owner": "SupervisedProject", "thread_id": "expected"})
+        message = IAMService(self.project).send(["SupervisedProject"], "Wake", "Fixed notice")
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        calls = FakeSupervisorClient.instances[0].calls
+        self.assertFalse(any(method == "thread/start" for method, _ in calls))
+        turns = [params for method, params in calls if method == "turn/start"]
+        self.assertEqual(1, len(turns))
+        self.assertEqual("expected", turns[0]["threadId"])
+        self.assertIn(message["id"], turns[0]["input"][0]["text"])
+        self.assertTrue(DeliveryState.load(path).is_delivered(message["id"]))
+
+    async def test_guarded_unavailable_session_never_falls_back(self):
+        path = iam.mailbox("SupervisedProject") / ".codex-bridge-state.json"
+        state = DeliveryState.load(path)
+        state.thread_id = "expected"
+        state.save()
+        iam.write_atomic(iam.mailbox("SupervisedProject") / ".delivery-requirement.json",
+                         {"session_owner": "SupervisedProject", "thread_id": "expected"})
+        message = IAMService(self.project).send(["SupervisedProject"], "Wake", "Fixed notice")
+        class Unavailable(FakeSupervisorClient):
+            async def request(self, method, params):
+                self.calls.append((method, params))
+                raise AppServerError("Unavailable")
+        with patch("iam_orchestrator.AppServerClient", Unavailable):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        self.assertFalse(any(method in {"thread/start", "turn/start", "turn/steer"}
+                             for client in FakeSupervisorClient.instances for method, _ in client.calls))
+        self.assertFalse(DeliveryState.load(path).is_delivered(message["id"]))
+
+    async def test_explicit_repin_reloads_before_more_delivery(self) -> None:
+        self.baseline(self.project)
+        sender = IAMService(self.root / "Sender")
+        sender.send(["SupervisedProject"], "First", "Start delivery")
+        state_path = iam.mailbox("SupervisedProject") / ".codex-bridge-state.json"
+
+        async def repin(_seconds):
+            state = DeliveryState.load(state_path)
+            state.thread_id = "replacement-thread"
+            state.save()
+            sender.send(["SupervisedProject"], "Second", "Must not reach old thread")
+
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient), patch("iam_orchestrator.asyncio.sleep", repin):
+            await serve_once("ws://127.0.0.1:4500")
+        turns = [params for method, params in FakeSupervisorClient.instances[0].calls if method == "turn/start"]
+        self.assertEqual(1, len(turns))
+        self.assertEqual("replacement-thread", DeliveryState.load(state_path).thread_id)
+
+    async def test_shared_mailboxes_use_one_connection_and_preserve_secondary_binding(self) -> None:
+        secondary = self.root / "Secondary"
+        secondary.mkdir()
+        setup_project(secondary, sandbox="danger-full-access", approval_policy="never")
+        old_state = DeliveryState.load(iam.mailbox("Secondary") / ".codex-bridge-state.json")
+        old_state.thread_id = "old-secondary-thread"
+        old_state.save()
+        main(["session", "link", str(secondary), "--primary", str(self.project)])
+        self.baseline(self.project)
+        self.baseline(secondary)
+        sender = IAMService(self.root / "Sender")
+        first = sender.send(["SupervisedProject", "Secondary"], "Shared", "Two separate copies")
+        passes = 0
+
+        async def stop_after_two_passes(_seconds):
+            nonlocal passes
+            passes += 1
+            if passes == 2:
+                raise asyncio.CancelledError()
+
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient), patch("iam_orchestrator.asyncio.sleep", stop_after_two_passes):
+            with self.assertRaises(asyncio.CancelledError):
+                await serve_once("ws://127.0.0.1:4500")
+        self.assertEqual(1, len(FakeSupervisorClient.instances))
+        calls = FakeSupervisorClient.instances[0].calls
+        turns = [params for method, params in calls if method == "turn/start"]
+        self.assertEqual(2, len(turns))
+        self.assertEqual({"supervised-thread"}, {turn["threadId"] for turn in turns})
+        self.assertNotEqual(turns[0]["clientUserMessageId"], turns[1]["clientUserMessageId"])
+        secondary_turn = next(turn for turn in turns if "mailbox='Secondary'" in turn["input"][0]["text"])
+        self.assertEqual("on-request", secondary_turn["approvalPolicy"])
+        self.assertEqual([str(self.project.resolve())], secondary_turn["sandboxPolicy"]["writableRoots"])
+        saved = DeliveryState.load(old_state.path)
+        self.assertEqual("old-secondary-thread", saved.thread_id)
+        self.assertTrue(saved.is_delivered(first["id"]))
+
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -617,6 +967,29 @@ class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
         self.assertIsNone(state.thread_id)
 
+    async def test_supervisor_delivers_heartbeat_without_mail_or_thread_creation(self) -> None:
+        from iam_heartbeat import Heartbeats
+        state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        state.thread_id = "pinned-heartbeat"
+        state.save()
+        store = Heartbeats()
+        store.configure("SupervisedProject", "enable", state.thread_id)
+        with patch("iam_heartbeat.time.time", return_value=0):
+            store.schedule("SupervisedProject", "1970-01-01T00:15:00Z", "Review work")
+        client = AsyncMock()
+        async def request(method, params):
+            if method == "thread/read":
+                return {"thread": {"id": state.thread_id, "cwd": str(self.project.resolve()), "status": {"type": "idle"}}}
+            if method == "turn/start":
+                return {"turn": {"id": "heartbeat-turn"}}
+            self.fail("Unexpected method: " + method)
+        client.request.side_effect = request
+        with patch("iam_orchestrator.appserver_client", return_value=client):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        self.assertEqual("accepted", store.state("SupervisedProject")["outcome"])
+        self.assertEqual(1, sum(c.args[0] == "turn/start" for c in client.request.call_args_list))
+
     async def test_start_only_starts_shared_services_without_loading_mailbox_threads(self) -> None:
         args = argparse.Namespace(url="ws://127.0.0.1:4500")
         output = io.StringIO()
@@ -634,6 +1007,40 @@ class SupervisorIntegrationTests(unittest.IsolatedAsyncioTestCase):
         state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
         self.assertIsNone(state.thread_id)
         self.assertNotIn("Codex mailboxes", output.getvalue())
+
+    async def test_heartbeat_uncertainty_does_not_block_ordinary_mail(self):
+        from iam_heartbeat import Heartbeats
+        self.baseline(self.project)
+        state = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        state.thread_id = "supervised-thread"
+        state.save()
+        store = Heartbeats()
+        store.configure("SupervisedProject", "enable", state.thread_id)
+        with patch("iam_heartbeat.time.time", return_value=0):
+            store.schedule("SupervisedProject", "1970-01-01T00:15:00Z", "Private purpose")
+        batch = store.claim("SupervisedProject")
+        store.hold("SupervisedProject", batch["id"])
+        sender_root = self.root / "Sender"
+        sender_root.mkdir()
+        mail = IAMService(sender_root).send(["SupervisedProject"], "Ordinary", "Deliver despite heartbeat hold")
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        saved = DeliveryState.load(state.path)
+        self.assertTrue(saved.is_delivered(mail["id"]))
+        self.assertTrue(store.state("SupervisedProject")["heartbeat_held"])
+        self.assertEqual(batch["id"], store.state("SupervisedProject")["delivery"]["id"])
+
+    async def test_external_attention_wait_does_not_block_ordinary_mail(self):
+        self.baseline(self.project)
+        sender_root = self.root / "Sender"
+        sender_root.mkdir()
+        mail = IAMService(sender_root).send(["SupervisedProject"], "Ordinary", "Independent of external attention")
+        async def held_lane(*_args):
+            await asyncio.Event().wait()
+        with patch("iam_orchestrator.AppServerClient", FakeSupervisorClient), patch("iam_fast_path.supervised_lane", held_lane):
+            await serve_once("ws://127.0.0.1:4500", run_once=True)
+        saved = DeliveryState.load(iam.mailbox("SupervisedProject") / ".codex-bridge-state.json")
+        self.assertTrue(saved.is_delivered(mail["id"]))
 
     async def test_supervisor_creates_and_pins_thread_only_for_new_mail(self) -> None:
         self.baseline(self.project)

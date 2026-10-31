@@ -9,6 +9,29 @@ from iam_service import IAMError, IAMService
 
 
 class IAMServiceTests(unittest.TestCase):
+    def test_bom_message_is_readable_and_content_preserved(self):
+        import json
+        message = self.beta.send(["Alpha"], "Encoding", "First line\nSecond line")
+        path = iam.mailbox("Alpha") / "inbox" / (message["id"] + ".json")
+        path.write_text(json.dumps(message), encoding="utf-8-sig")
+        self.assertEqual(message, iam.load(path))
+        self.assertEqual(message["body"], self.alpha.inbox()[0]["body"])
+
+    def test_malformed_messages_do_not_hide_valid_mail_or_change_files(self):
+        message = self.beta.send(["Alpha"], "Good", "Keep this")
+        paths = []
+        for name, content in [("broken", "{unfinished"), ("array", "[]"),
+                              ("missing", '{"subject":"no identity"}')]:
+            path = iam.mailbox("Alpha") / "inbox" / (name + ".json")
+            path.write_text(content, encoding="utf-8")
+            paths.append((path, path.read_bytes()))
+        with self.assertLogs("interagentmail", level="WARNING") as logs:
+            self.assertEqual([message], self.alpha.inbox())
+            self.assertEqual([message], self.alpha.list_messages())
+        self.assertEqual(6, len(logs.output))
+        for path, content in paths:
+            self.assertEqual(content, path.read_bytes())
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

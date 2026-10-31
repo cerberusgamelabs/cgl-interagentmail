@@ -10,14 +10,18 @@ import hashlib
 import json
 import logging
 import mimetypes
+import math
 import os
 import re
 import secrets
+import sqlite3
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import websockets
@@ -43,6 +47,51 @@ def config_path() -> Path:
 
 def state_path() -> Path:
     return iam.ROOT / "webconnect-state.json"
+
+
+def health_path() -> Path:
+    return iam.ROOT / 'run' / 'connect-health.json'
+
+
+def health_identity(config):
+    return hashlib.sha256(json.dumps([config['server_url'], config['node_id']],
+                                    separators=(',', ':')).encode()).hexdigest()
+
+
+def write_health(config, state):
+    """Body-free process health, never a mail-delivery or agent-response receipt."""
+    try:
+        iam.write_atomic(health_path(), dict(version=1, pid=os.getpid(),
+            parent_pid=os.getppid(), identity=health_identity(config),
+            state=state, checked_at=time.time()))
+    except OSError:
+        LOG.warning('Connector health record could not be written.')
+
+
+def connector_health(config, pid, running, now=None):
+    if not running:
+        return 'stopped'
+    try:
+        record = iam.load(health_path())
+        checked = record.get('checked_at')
+        if (record.get('version') != 1 or type(pid) is not int
+                or pid not in (record.get('pid'), record.get('parent_pid'))
+                or record.get('identity') != health_identity(config)):
+            return 'unverified'
+        if (type(checked) not in (int, float) or not math.isfinite(checked)
+                or not 0 <= (time.time() if now is None else now) - checked <= 45):
+            return 'stale'
+        state = record.get('state')
+        return state if state in {'connecting', 'ready', 'disconnected', 'failed', 'stopped'} else 'unverified'
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 'unverified'
+
+
+async def verify_relay(socket, config):
+    # A successful send is not enough: require the connected peer's pong.
+    pong = await asyncio.wait_for(socket.ping(), timeout=5)
+    await asyncio.wait_for(pong, timeout=5)
+    write_health(config, 'ready')
 
 
 def attachment_root() -> Path:
@@ -99,6 +148,27 @@ def save_config(data: dict[str, Any]) -> None:
         os.chmod(config_path(), 0o600)
 
 
+def email_registration(service: IAMService, action: str, local: str | None = None) -> dict[str, Any]:
+    """Use the configured node credential; identity comes from the bound service."""
+    if action not in {"available", "register", "status"}:
+        raise WebConnectError("Unsupported email registration action")
+    config = load_config()
+    parsed = urlparse(config["server_url"])
+    origin = ("https" if parsed.scheme == "wss" else "http") + "://" + parsed.netloc
+    payload = json.dumps({"mailbox": service.address, "action": action, "local": local}).encode("utf-8")
+    request = Request(origin + "/v1/node-email/" + quote(config["node_id"], safe=""), data=payload,
+                      headers={"Authorization": "Bearer " + config["node_token"], "Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=20) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        try:
+            message = json.loads(exc.read()).get("message", "Email registration was rejected")
+        except (ValueError, AttributeError):
+            message = "Email registration endpoint unavailable"
+        raise WebConnectError(message) from None
+
+
 @dataclass
 class ConnectorState:
     received: list[str] = field(default_factory=list)
@@ -145,6 +215,47 @@ class WebConnectClient:
         self.state = state or ConnectorState.load()
         self.human = IAMService.for_mailbox(self.config["human_mailbox"])
         self.humans = {address: IAMService.for_mailbox(address) for address in self.config["human_mailboxes"]}
+        self._attachment_retry_at: dict[str, float] = {}
+        self._invalid_sender_reported: set[str] = set()
+
+    def relay_sender_allowed(self, sender: Any, message_id: str) -> bool:
+        """Hold incompatible mail locally without changing its identity or delivery state."""
+        if isinstance(sender, str) and re.fullmatch(r"[A-Za-z0-9._-]+", sender):
+            self._invalid_sender_reported.discard(message_id)
+            return True
+        if message_id not in self._invalid_sender_reported:
+            # Log an ID only: sender/content may be private or contain control text.
+            safe_id = message_id if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", message_id) else "invalid-id"
+            LOG.warning("Relay export held for message %s: incompatible sender; original retained locally.", safe_id)
+            self._invalid_sender_reported.add(message_id)
+        return False
+
+    def relay_outbound(self) -> list[dict[str, Any]]:
+        """Filter persisted frames too; never acknowledge or discard held frames."""
+        return [frame for identifier, frame in self.state.outbound.items()
+                if self.relay_sender_allowed(frame.get("payload", {}).get("from"), identifier)]
+
+    def outbound_attachments(self, message: dict[str, Any]) -> list[dict[str, Any]]:
+        entries = message.get("attachments") or []
+        resolved = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("path"), str) or not entry["path"]:
+                raise WebConnectError("Invalid attachment path.")
+            source = Path(entry["path"]).expanduser()
+            if not source.is_absolute():
+                projects = iam.load(iam.CONFIG).get("projects", {})
+                project = projects.get(str(message.get("from") or ""), {})
+                root = project.get("project_root")
+                if not root:
+                    raise WebConnectError("Relative attachment requires a registered sender project.")
+                root = Path(root).resolve()
+                source = (root / source).resolve()
+                if not source.is_relative_to(root):
+                    raise WebConnectError("Relative attachment escapes the sender project.")
+            if not source.is_file():
+                raise WebConnectError("Attachment path does not exist.")
+            resolved.append({**entry, "path": str(source)})
+        return [self.upload_attachment(entry) for entry in resolved]
 
     @property
     def url(self) -> str:
@@ -212,6 +323,8 @@ class WebConnectClient:
         if sender_address not in self.humans:
             raise WebConnectError("WebConnect server sent mail with an unexpected human identity.")
         sender = self.humans[sender_address]
+        if payload.get("origin") == "external_email" and not isinstance(payload.get("external_email"), dict):
+            raise WebConnectError("External email is missing its relay identity.")
         to = payload.get("to")
         if not isinstance(to, list) or not to or any(not isinstance(name, str) for name in to):
             raise WebConnectError("WebConnect mail recipients are invalid.")
@@ -227,7 +340,17 @@ class WebConnectClient:
             if payload.get("origin") == "external_email" and isinstance(payload.get("external_email"), dict):
                 external_id = str(payload["external_email"].get("id") or "")
                 if re.fullmatch(r"[A-Za-z0-9-]{8,128}", external_id):
-                    metadata["external_email"] = {"id": external_id}
+                    external = payload["external_email"]
+                    claimed_from = str(external.get("from") or "Unknown external sender")
+                    claimed_from = re.sub(r"[\x00-\x1f\x7f]", " ", claimed_from)[:320]
+                    metadata["external_email"] = {
+                        "id": external_id, "from": claimed_from,
+                        "reply_to": str(external.get("reply_to") or ""),
+                        "address": str(external.get("address") or ""),
+                        "routing_owner": sender_address, "approval_required": True,
+                    }
+                else:
+                    raise WebConnectError("External email has an invalid relay identity.")
             sender.send(to, str(payload.get("subject") or ""), str(payload.get("body") or ""),
                         priority=str(payload.get("priority") or "normal"), thread=payload.get("thread"),
                         attachments=attachments, references=[f"webconnect:{message_id}"],
@@ -238,11 +361,16 @@ class WebConnectClient:
     def queue_replies(self) -> None:
         for human in self.humans.values():
             sent_by_id = {str(item.get("id") or ""): item for item in human.list_messages("sent", limit=1000)}
+            address_key = human.address.casefold()
             for message in human.inbox(limit=1000):
                 message_id = str(message.get("id") or "")
-                if not message_id or message_id in self.state._observed or message.get("from") == human.address:
+                if not message_id or message_id in self.state._observed or str(message.get("from") or "").casefold() == address_key:
                     continue
-                if human.address not in [*message.get("to", []), *message.get("cc", [])]:
+                recipients = {value.casefold() for value in [*message.get("to", []), *message.get("cc", [])]
+                              if isinstance(value, str)}
+                if address_key not in recipients:
+                    continue
+                if not self.relay_sender_allowed(message.get("from"), message_id):
                     continue
                 frame_id = str(uuid.uuid4())
                 external_id = None
@@ -252,7 +380,18 @@ class WebConnectClient:
                     if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9-]{8,128}", candidate):
                         external_id = candidate
                         break
-                payload = {"from": message.get("from"), "to": [human.address], "subject": message.get("subject"), "body": message.get("body"), "priority": message.get("priority", "normal"), "thread": message.get("thread"), "attachments": [self.upload_attachment(item) for item in message.get("attachments", [])]}
+                if time.monotonic() < self._attachment_retry_at.get(message_id, 0):
+                    continue
+                try:
+                    attachments = self.outbound_attachments(message)
+                except (OSError, ValueError) as exc:
+                    # Keep the original unobserved and retry later, without taking
+                    # down the socket or starving unrelated mailboxes/messages.
+                    self._attachment_retry_at[message_id] = time.monotonic() + 60
+                    LOG.warning("Attachment export deferred for message %s (%s); other mail continues.", message_id, type(exc).__name__)
+                    continue
+                self._attachment_retry_at.pop(message_id, None)
+                payload = {"from": message.get("from"), "to": [human.address], "subject": message.get("subject"), "body": message.get("body"), "priority": message.get("priority", "normal"), "thread": message.get("thread"), "attachments": attachments}
                 if external_id:
                     payload["external_email_id"] = external_id
                 self.state.outbound[frame_id] = {
@@ -271,6 +410,18 @@ class WebConnectClient:
             return []
         return sorted(address for address in projects if isinstance(address, str) and re.fullmatch(r"[A-Za-z0-9._-]+", address))
 
+    def mailbox_directory(self) -> dict[str, Any]:
+        addresses = self.project_mailboxes()
+        names = {}
+        for address in [*addresses, *self.humans]:
+            try:
+                name = iam.profile(address).get("display_name")
+                if isinstance(name, str) and name.strip() and len(name) <= 200 and not any(ord(c) < 32 or ord(c) == 127 for c in name):
+                    names[address] = name.strip()
+            except (OSError, ValueError):
+                continue
+        return {"protocol": PROTOCOL, "version": VERSION, "type": "mailboxes", "mailboxes": addresses, "display_names": names}
+
     def baseline_existing_replies(self) -> None:
         """Do not export mail that predates the connector's configuration."""
         for human in self.humans.values():
@@ -288,19 +439,105 @@ class WebConnectClient:
             if registered.get("type") != "registered" or set(registered_mailboxes) != set(self.humans):
                 raise WebConnectError("WebConnect server rejected the configured node or human mailbox.")
             LOG.info("WebConnect node %s registered with %s.", self.config["node_id"], self.url)
-            mailboxes = self.project_mailboxes()
-            LOG.info("Publishing %d registered project mailbox(es).", len(mailboxes))
-            await socket.send(json.dumps({"protocol": PROTOCOL, "version": VERSION, "type": "mailboxes", "mailboxes": mailboxes}))
-            for frame in self.state.outbound.values():
+            directory = self.mailbox_directory()
+            LOG.info("Publishing %d registered project mailbox(es).", len(directory["mailboxes"]))
+            await socket.send(json.dumps(directory))
+            next_directory_check = time.monotonic() + 30
+            next_push_check = 0
+            from iam_messenger_stream import ForegroundStreams
+            foreground_streams=ForegroundStreams()
+            next_stream_check=0
+            for frame in self.relay_outbound():
                 await socket.send(json.dumps(frame))
+            next_health_check = 0
             while True:
+                if time.monotonic() >= next_health_check:
+                    await verify_relay(socket, self.config)
+                    next_health_check = time.monotonic() + 10
+                if foreground_streams.leases and time.monotonic()>=next_stream_check:
+                    from iam_messenger_pairing import Pairings
+                    from iam_desktop import DesktopStore
+                    try:
+                        for update in foreground_streams.updates(DesktopStore(iam.ROOT/'run'/'desktop.sqlite3'),
+                                Pairings(iam.ROOT/'run'/'messenger-pairings.db'),self.config,int(time.time())):
+                            await socket.send(json.dumps(update))
+                    except (OSError,sqlite3.Error,ValueError):
+                        for stream_id,lease in foreground_streams.leases.items():
+                            await socket.send(json.dumps(dict(protocol=PROTOCOL,version=VERSION,type='messenger_stream_state',
+                                stream_id=stream_id,account_id=lease['principal'].account_id,device_id=lease['principal'].device_id,
+                                revision=lease['revision']+1,state='ended')))
+                        foreground_streams.leases.clear()
+                        LOG.warning('Foreground stream state unavailable; leases dropped.')
+                    next_stream_check=time.monotonic()+1
+                if time.monotonic() >= next_push_check and self.config.get('messenger',{}).get('notifications_enabled') is True:
+                    from iam_messenger_pairing import Pairings
+                    from iam_messenger_reads import push_states
+                    from iam_desktop import DesktopStore
+                    try:
+                        states=push_states(DesktopStore(iam.ROOT/'run'/'desktop.sqlite3'),
+                            Pairings(iam.ROOT/'run'/'messenger-pairings.db'),self.config,int(time.time()))
+                        for update in states: await socket.send(json.dumps(update))
+                    except (OSError,sqlite3.Error,ValueError):
+                        LOG.warning('Messenger notification state unavailable; no content logged.')
+                    next_push_check=time.monotonic()+10
+                if time.monotonic() >= next_directory_check:
+                    updated = self.mailbox_directory()
+                    if updated != directory:
+                        await socket.send(json.dumps(updated))
+                        directory = updated
+                    next_directory_check = time.monotonic() + 30
                 try:
                     frame = json.loads(await asyncio.wait_for(socket.recv(), timeout=1))
                 except asyncio.TimeoutError:
                     self.queue_replies()
-                    for frame in self.state.outbound.values(): await socket.send(json.dumps(frame))
+                    for frame in self.relay_outbound(): await socket.send(json.dumps(frame))
                     continue
-                if frame.get("type") == "mail":
+                if frame.get('type') == 'messenger_friend_changed':
+                    from iam_messenger_friend_delivery import FriendQueue
+                    from iam_orchestrator import registered_projects
+                    config=load_config()
+                    names=frame.get('mailboxes')
+                    if (config.get('enabled') is True and config.get('messenger',{}).get('friendships_enabled') is True
+                            and frame.get('protocol')==PROTOCOL and frame.get('version')==VERSION
+                            and isinstance(names,list) and len(names)<=500 and all(isinstance(n,str) for n in names)):
+                        known=registered_projects();queue=FriendQueue()
+                        for mailbox in set(names):
+                            if mailbox in known:queue.signal(mailbox)
+                elif frame.get('type') == 'messenger_friend_policy':
+                    from iam_messenger_friends import policy_request
+                    from iam_desktop import DesktopStore
+                    from iam_orchestrator import registered_projects
+                    # Fresh local owner policy, not cached connector startup state.
+                    try:
+                        result=policy_request(frame,load_config(),DesktopStore(),registered_projects())
+                    except (OSError,ValueError,sqlite3.Error):
+                        result=dict(protocol=PROTOCOL,version=VERSION,type='messenger_friend_policy_result',id=frame.get('id'),error='friend_policy_unavailable')
+                    await socket.send(json.dumps(result))
+                elif frame.get("type") in ("messenger_pairing_request", "messenger_pairing_status", "messenger_pairing_claim",
+                                         "messenger_history_challenge", "messenger_history_read",
+                                         "messenger_events_challenge", "messenger_events_sync",
+                                         "messenger_send_challenge", "messenger_send_submit",
+                                         "messenger_attachment_challenge", "messenger_attachment_transfer"):
+                    from iam_messenger_connector import pairing_request, history_request, send_request, attachment_request, events_request
+                    # Never create state while the feature is disabled.
+                    policy = self.config.get('messenger', {})
+                    store = None
+                    if isinstance(policy, dict) and policy.get('enabled') is True:
+                        from iam_messenger_pairing import Pairings
+                        (iam.ROOT / 'run').mkdir(parents=True, exist_ok=True)
+                        store = Pairings(iam.ROOT / 'run' / 'messenger-pairings.db')
+                    if frame['type'].startswith('messenger_events_'):
+                        result = events_request(frame,self.config,store,iam.ROOT / 'run' / 'desktop.sqlite3',streams=foreground_streams)
+                    elif frame['type'].startswith('messenger_attachment_'):
+                        result = attachment_request(frame,self.config,store,iam.ROOT / 'run' / 'desktop.sqlite3')
+                    elif frame['type'].startswith('messenger_send_'):
+                        result = send_request(frame,self.config,store,iam.ROOT / 'run' / 'desktop.sqlite3')
+                    elif frame['type'].startswith('messenger_history_'):
+                        result = history_request(frame,self.config,store,iam.ROOT / 'run' / 'desktop.sqlite3')
+                    else:
+                        result = pairing_request(frame,self.config,store)
+                    await socket.send(json.dumps(result,ensure_ascii=False))
+                elif frame.get("type") == "mail":
                     acknowledgement = await self.receive_mail(frame)
                     if acknowledgement: await socket.send(json.dumps(acknowledgement))
                 elif frame.get("type") == "ack" and frame.get("id") in self.state.outbound:
@@ -313,9 +550,22 @@ class WebConnectClient:
             LOG.info("WebConnect is disabled in local configuration.")
             return
         while True:
-            try: await self.run_once()
+            write_health(self.config, 'connecting')
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                write_health(self.config, 'stopped')
+                raise
             except (OSError, asyncio.TimeoutError, websockets.WebSocketException, WebConnectError) as exc:
-                LOG.warning("WebConnect connection ended: %s", exc); await asyncio.sleep(5)
+                write_health(self.config, 'disconnected')
+                LOG.warning("WebConnect connection ended: %s", exc)
+                await asyncio.sleep(5)
+            except Exception:
+                write_health(self.config, 'failed')
+                raise
+            else:
+                write_health(self.config, 'disconnected')
+                await asyncio.sleep(5)
 
 
 def main() -> None:
