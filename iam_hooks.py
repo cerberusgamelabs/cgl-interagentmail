@@ -88,7 +88,14 @@ def private_directory(path):
         env = dict(os.environ, IAM_HOOK_ACL_PATH=str(path))
         sddl = subprocess.check_output([
             "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-            "Get-Acl -LiteralPath $env:IAM_HOOK_ACL_PATH | Select-Object -ExpandProperty Sddl",
+            # A caller running PowerShell 7 can export its incompatible module
+            # paths to Windows PowerShell 5.1. Load the executing host's own
+            # security module explicitly; keep ACL failures fail-closed.
+            "$ErrorActionPreference = 'Stop'; "
+            "Import-Module (Join-Path $PSHOME "
+            "'Modules/Microsoft.PowerShell.Security/Microsoft.PowerShell.Security.psd1') "
+            "-ErrorAction Stop; "
+            "(Microsoft.PowerShell.Security\\Get-Acl -LiteralPath $env:IAM_HOOK_ACL_PATH).Sddl",
         ], text=True, env=env, creationflags=subprocess.CREATE_NO_WINDOW).strip()
         aces = re.findall(r"\(([^()]*)\)", sddl)
         require(aces and all(ace.split(";")[-1] in (sid, "SY", "S-1-5-18") for ace in aces),

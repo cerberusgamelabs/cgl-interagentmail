@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from dataclasses import asdict
 from uuid import uuid4
@@ -17,7 +18,7 @@ from iam_messenger_connector import history_request
 class HistoryTests(unittest.TestCase):
     def test_delivery_markers_do_not_expose_error_details(self):
         from iam_messenger_history import history_page
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("UPDATE requests SET reply=NULL,state='accepted',error='Turn finished; no reply published.' WHERE id='1'")
         page=history_page(self.path,'pilot',0,json.dumps({'after':[0,''],'limit':50}))
         event=next(e for e in page['events'] if e['event_id']=='1:request')
@@ -25,10 +26,9 @@ class HistoryTests(unittest.TestCase):
 
     def test_history_documents_are_metadata_only(self):
         from iam_messenger_history import history_page
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS documents(kind TEXT,message_id TEXT,data TEXT)')
             db.execute('INSERT INTO documents VALUES(?,?,?)',('reply','1',json.dumps([{'name':'notes.txt','data':'YWJj'}])))
-        db.close()
         page=history_page(self.path,'pilot',105,json.dumps({'after':[0,''],'limit':50}))
         event=next(e for e in page['events'] if e['event_id']=='1:reply')
         self.assertEqual([{'name':'notes.txt','size':3}],event['documents'])
@@ -41,7 +41,7 @@ class HistoryTests(unittest.TestCase):
     def test_full_text_preserves_unicode_and_cutoff_and_excludes_private_events(self):
         import hashlib
         text=('hello'+chr(0x1f600))*20000
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute('INSERT INTO notices VALUES(?,?,?,?,?)',('large','pilot',text,114,'agent'))
         raw=text.encode();parts=[]
         for offset in range(0,len(raw),65536):
@@ -60,7 +60,7 @@ class HistoryTests(unittest.TestCase):
 
     def test_full_text_revalidation_and_empty_and_size_limit(self):
         from iam_messenger_history import text_chunk
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute('INSERT INTO notices VALUES(?,?,?,?,?)',('empty','pilot','',114,'agent'))
             db.execute('INSERT INTO notices VALUES(?,?,?,?,?)',('huge','pilot','a'*1000001,114,'agent'))
         self.assertEqual(self.text_read('empty:notice')['text']['total'],0)
@@ -75,7 +75,7 @@ class HistoryTests(unittest.TestCase):
         self.assertNotIn('text',result)
 
     def test_maximum_full_text_fits_existing_proof_budget(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute('INSERT INTO notices VALUES(?,?,?,?,?)',('maximum','pilot','a'*1000000,114,'agent'))
         size=0
         for offset in range(0,1000000,65536):
@@ -99,7 +99,7 @@ class HistoryTests(unittest.TestCase):
         self.frame=dict(protocol='iam-webconnect',version=1,type='messenger_history_challenge',id=str(uuid4()),
             principal=asdict(principal),installation_id='node',conversation_id='pilot',grant_id=grant,
             content=base64.b64encode(b'{"after":[0,""],"limit":1}').decode())
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.executescript('''CREATE TABLE requests(id TEXT,mailbox TEXT,body TEXT,created REAL,state TEXT,reply TEXT,error TEXT);
               CREATE TABLE reply_times(request_id TEXT,created REAL);
               CREATE TABLE notices(id TEXT,mailbox TEXT,body TEXT,created REAL,kind TEXT);
@@ -155,7 +155,7 @@ class HistoryTests(unittest.TestCase):
         self.assertNotIn('events',result)
 
     def test_large_unicode_output_is_bounded_and_explicit(self):
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             db.execute('INSERT INTO requests VALUES(?,?,?,?,?,?,?)',
                 ('large','pilot',chr(0x1f600)*32000,114,'queued',None,'private detail'))
         content=base64.b64encode(b'{"after":[113,""],"limit":50}').decode()
@@ -166,7 +166,7 @@ class HistoryTests(unittest.TestCase):
 
     def test_reverse_pages_start_newest_and_respect_ties_and_cutoff(self):
         from iam_messenger_history import history_page
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db, db:
             for i in range(120):
                 db.execute('INSERT INTO notices VALUES(?,?,?,?,?)',(f'n{i:03}','pilot','notice',200+i//3,'agent'))
         first=history_page(self.path,'pilot',105,json.dumps({'before':None,'limit':50}))
