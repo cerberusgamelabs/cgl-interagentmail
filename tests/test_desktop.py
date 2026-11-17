@@ -282,6 +282,17 @@ class DesktopRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.backend.deliver_once({'id':request_id,'mailbox':'One','body':'Hello'})
         self.assertEqual('queued',self.store.history('One')[0]['state'])
 
+    async def test_system_error_is_not_busy_and_keeps_message_queued(self):
+        rid = str(uuid.uuid4())
+        self.store.create('One', 'Hello', rid)
+        client = MagicMock(request=AsyncMock(return_value={'thread': {'status': {'type': 'systemError'}}}))
+        self.backend.clients['One'] = (client, 'thread')
+        with patch.object(desktop, 'session_owner', return_value='One'), patch.object(self.backend, 'open', new=AsyncMock(return_value={'state': 'attached'})):
+            await self.backend.deliver_once({'id': rid, 'mailbox': 'One', 'body': 'Hello'})
+        self.assertEqual('session error', self.backend.statuses['One'])
+        self.assertEqual('queued', self.store.history('One')[0]['state'])
+        client.request.assert_awaited_once_with('thread/read', {'threadId': 'thread', 'includeTurns': False})
+
     async def test_image_sent_as_local_image_to_exact_thread(self):
         rid = str(uuid.uuid4())
         images = [{'name':'test.png','data':'data:image/png;base64,' + base64.b64encode(b'\x89PNG\r\n\x1a\nfixture').decode()}]

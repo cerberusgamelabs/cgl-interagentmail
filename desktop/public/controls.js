@@ -15,6 +15,7 @@ async function prepare(action, args = {}) {
   text('Confirm this action on the exact session below. Confirmation expires in 60 seconds.');
   show({action:receipt.kind, thread:receipt.thread, parameters:receipt.parameters});
   if(action==='stop') text('Interrupts only this observed turn. Already-completed actions are not undone.');
+  if(action==='recover') text('Detaches only this errored Messenger session, preserving its history. After unloading, queued messages can proceed on the same thread. Other subscribers may prevent unloading.');
   if(action==='compact') text('Summarizes earlier context; this changes what the session retains verbatim.');
   const confirm=button('Confirm',async()=>{
     confirm.disabled=true;
@@ -107,6 +108,7 @@ async function load() {
       const b=button('Review mode change',()=>prepare('plan',{mode:mode.value}));b.disabled=data.state!=='idle';
     }
     $('notice').textContent='';
+    if(data.state==='systemError') button('Review recovery of errored session',()=>prepare('recover'));
   } catch(e){$('notice').textContent=e.message;}
 }
 $('refresh').onclick=()=>{if(!busy)load();};
@@ -117,7 +119,7 @@ async function accountPairing() {
   $('title').textContent='Connect phone';$('scope').textContent='Account-based owner pairing';
   const pairing=(operation,args={})=>window.iam.call('pairing-review',{mailbox,operation,...args});
   const roster=await pairing('roster');
-  text('Sign in on your phone to this account. Choose conversations, scan the QR, then compare the phone fingerprint before approving. New conversations are not added automatically.');
+  text('Link this entire desktop: all current and future registered agents will appear automatically. This grants owner access, not friend access. Existing limited links remain limited until you approve a new desktop-wide link. Scan the QR, then compare the phone fingerprint before approving.');
   show({home:roster.home,account:roster.account,installation:roster.installation});
   button('Review or revoke paired phones',async()=>{
     const grants=await pairing('grants');$('content').replaceChildren();
@@ -133,16 +135,10 @@ async function accountPairing() {
     }
     button('Back',load);
   });
-  const checks=[];
-  button('Select all current conversations',async()=>{if(checks.length>64)throw new Error('Select at most 64 conversations.');for(const c of checks)c.checked=true;});
-  const choices=document.createElement('div');choices.className='pairing-choices';$('content').append(choices);
-  for(const name of roster.conversations){
-    const label=document.createElement('label'),check=document.createElement('input');
-    check.type='checkbox';check.value=name;label.append(check,document.createTextNode(name));choices.append(label);checks.push(check);
-  }
+  show({currentAgents:roster.conversations,scope:'All current and future agents on this desktop'});
   const history=select('History consent',[['new','Only messages from now'],['existing','Include existing Messenger history']]);
   button('Create five-minute invitation',async()=>{
-    const invitation=await pairing('invite',{conversations:checks.filter(c=>c.checked).map(c=>c.value),include_history:history.value==='existing'});
+    const invitation=await pairing('invite',{desktop_scope:true,include_history:history.value==='existing'});
     $('content').replaceChildren();
     text('Scan with Connect desktop in the signed-in phone app. Or paste the complete manual code. This is not an approval.');
     const image=document.createElement('img');image.src=invitation.qr;image.alt='Single-use phone pairing QR';image.width=280;image.height=280;$('content').append(image);
@@ -151,6 +147,7 @@ async function accountPairing() {
     button('Review scanned phone',async()=>{
       const receipt=await pairing('prepare-invite',{challenge:invitation.challenge});
       $('content').replaceChildren();
+      text(receipt.desktop_scope?'Approval covers ALL current and future agents on this desktop.':'Legacy limited approval: only the listed conversations.');
       text('Compare this fingerprint with your phone. This device can act as you with the existing agent session permissions. Approve only your own phone.');
       show({account:receipt.identity.account_id,device:receipt.identity.device_id,keyFingerprint:receipt.key_fingerprint,conversations:receipt.conversations,existingHistory:receipt.include_history,expires:new Date(receipt.expires_at*1000).toLocaleString()});
       button('Approve this account and phone',async()=>{

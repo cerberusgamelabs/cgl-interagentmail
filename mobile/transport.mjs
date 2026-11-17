@@ -28,9 +28,22 @@ export class MessengerTransport {
         headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},
         body:JSON.stringify(body)});
       if(!response.ok) {
-        // Never display arbitrary server HTML, bodies, credentials or exceptions.
-        const error=new Error(response.status===401?'Sign-in required':response.status===429?
-          'Too many requests; try again later':response.status===503?'Messenger is unavailable':'Messenger request rejected');
+        // Only the explicit public error envelope is displayable; never raw bodies.
+        let publicMessage,code;
+        try {
+          if((response.headers?.get('content-type') || '').split(';')[0].trim()==='application/json') {
+            const value=await response.json();
+            const detail=value?.public_error;
+            if(detail?.version===1 && typeof detail.code==='string' && /^[a-z][a-z0-9_]{0,79}$/.test(detail.code) &&
+               typeof detail.message==='string' && detail.message.length>0 && detail.message.length<=300 &&
+               !/[<>\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(detail.message)) {
+              publicMessage=detail.message;code=detail.code;
+            }
+          }
+        } catch { /* Invalid/offline intermediary responses use local fallbacks. */ }
+        const error=new Error(publicMessage || (response.status===401?'Sign-in required':response.status===429?
+          'Too many requests; try again later':response.status===503?'Messenger is unavailable':'Messenger request rejected'));
+        if(code)error.code=code;
         error.status=response.status;throw error;
       }
       return await response.json();
@@ -39,11 +52,12 @@ export class MessengerTransport {
       throw new Error('Connection interrupted; outcome is uncertain. No automatic retry was sent.');
     } finally {clearTimeout(timer);}
   }
-  async login(email,password,deviceLabel) {
+  async login(email,password,deviceLabel,previousToken=null) {
     // A failed new login cannot retain an earlier person's session.
     this.session=null;
     const generation=++this.generation;
-    const value=await this.request('/v1/messenger/login',{email,password,device_label:deviceLabel});
+    const value=await this.request('/v1/messenger/login',{email,password,device_label:deviceLabel,
+      ...(typeof previousToken==='string' && /^[A-Za-z0-9_-]{43}$/.test(previousToken)?{previous_token:previousToken}:{})});
     if(generation!==this.generation)throw new Error('Sign-in superseded; no session restored');
     if(typeof value.token!=='string' || !/^[A-Za-z0-9_-]{43}$/.test(value.token) ||
        !Number.isSafeInteger(value.expiresAt) || value.expiresAt<=Date.now() ||
@@ -54,7 +68,7 @@ export class MessengerTransport {
     return {deviceId:value.deviceId,accountId:value.account_id,homeServer:value.home_server,expiresAt:value.expiresAt};
   }
   async friends(operation,input={}) {
-    if(!['self','roster','invite','discover','request','decide','send','history','read','listen','attachment','typing'].includes(operation) || !this.session)throw Error('Friend operation unavailable');
+    if(!['notifications','self','roster','invite','discover','request','decide','send','history','read','listen','attachment','typing'].includes(operation) || !this.session)throw Error('Friend operation unavailable');
     const session=this.session,generation=this.generation;
     const result=await this.request('/v1/messenger/friends/'+operation,input,session.token);
     if(session!==this.session || generation!==this.generation)throw Error('Account changed; response discarded');
@@ -107,9 +121,9 @@ export class MessengerTransport {
        !Number.isSafeInteger(value.expires_at) || value.expires_at*1000<=Date.now() ||
        (value.state==='approved' && (typeof value.grant_id!=='string' || !/^[A-Za-z0-9_-]{32,128}$/.test(value.grant_id))))
       throw new Error('Invalid pairing status');
-    if(value.conversations!==undefined && (!Array.isArray(value.conversations) || value.conversations.length>100 ||
+    if(value.conversations!==undefined && (!Array.isArray(value.conversations) || value.conversations.length>1024 ||
         value.conversations.some(c=>typeof c!=='string' || !c || c.length>512)))throw new Error('Invalid pairing scope');
-    return {state:value.state,expiresAt:value.expires_at,
+    return {state:value.state,expiresAt:value.expires_at,...(value.desktop_scope===true?{desktopScope:true}:{}),
       ...(value.state==='approved'?{grantId:value.grant_id,...(value.conversations?{conversations:value.conversations,displayNames:Object.fromEntries(value.conversations.filter(c=>Object.hasOwn(value.display_names || {},c) && typeof value.display_names[c]==='string' && value.display_names[c].length<=512).map(c=>[c,value.display_names[c]]))}:{})}:{})};
   }
   async claimInvitation(installationId,challenge,publicKey) {
@@ -209,7 +223,12 @@ export class MessengerTransport {
       if(!Array.isArray(result.roster) || result.roster.length!==roster.length || result.roster.some((r,i)=>r.conversation!==roster[i].conversation || typeof r.display_name!=='string' || r.display_name.length>512 || !Number.isSafeInteger(r.unread) || r.unread<0))throw Error('Invalid roster response');
       rosterResult=result.roster.map(r=>({conversation:r.conversation,displayName:r.display_name,unread:r.unread,profile:publicProfile(r.profile)}));
     }
-    return {unread:result.unread,subscriptions:result.subscriptions.map(s=>({id:s.id,revision:s.revision,unread:s.unread ?? result.unread})),...(listen?{stream:result.stream}:{}),...(typeof result.display_name==='string' && result.display_name.length<=512?{displayName:result.display_name}:{}),profile:publicProfile(result.profile),deliveries,...(rosterResult?{roster:rosterResult}:{})};
+    let desktopRoster;
+    if(conversationId==='@desktop'){
+      if(!Array.isArray(result.desktop_roster) || result.desktop_roster.length>1024 || result.desktop_roster.some(r=>typeof r.conversation!=='string' || !r.conversation || r.conversation==='@desktop' || r.conversation.length>512 || typeof r.display_name!=='string' || r.display_name.length>512))throw Error('Invalid desktop roster');
+      desktopRoster=result.desktop_roster.map(r=>({conversation:r.conversation,displayName:r.display_name}));
+    }
+    return {unread:result.unread,subscriptions:result.subscriptions.map(s=>({id:s.id,revision:s.revision,unread:s.unread ?? result.unread})),...(listen?{stream:result.stream}:{}),...(typeof result.display_name==='string' && result.display_name.length<=512?{displayName:result.display_name}:{}),profile:publicProfile(result.profile),deliveries,...(rosterResult?{roster:rosterResult}:{}),...(desktopRoster?{desktopRoster}:{})};
   }
   async lookupSend(installationId,conversationId,grantId,requestId,body,sign,image=null,files=[]) {
     const session=this.session,generation=this.generation;

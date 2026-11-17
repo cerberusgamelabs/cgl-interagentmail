@@ -7,9 +7,36 @@ from iam_messenger_access import AccessDenied
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import serialization
 import base64
+from unittest.mock import patch
+from iam_messenger_proof import OwnerProofs
 
 
 class InvitationTests(PairingTests):
+    def test_desktop_grant_is_explicit_dynamic_and_revocable(self):
+        invitation=self.store.invite('home','lily','installation',set(),include_history=False,now=100,desktop_scope=True)
+        token=invitation['challenge']
+        self.store.claim_invitation(token,self.person,'installation',self.key,now=101)
+        with self.assertRaises(AccessDenied):
+            self.store.approve(token,self.person,'installation',set(),now=102,expires_at=1000,history_from=100,expected_owner_key=self.key)
+        review=PairingReview(self.store)
+        receipt=review.prepare_invitation(token,set(),now=102)
+        self.assertTrue(receipt['desktop_scope'])
+        grant=review.confirm_invitation(receipt['ticket'],{'future'},now=103)
+        with patch.object(self.store,'desktop_conversations',return_value=['future']):
+            proofs=OwnerProofs(self.store)
+            self.assertTrue(self.store.status(token,self.person,'installation',now=104)['desktop_scope'])
+            self.assertEqual(self.store.status(token,self.person,'installation',now=104)['conversations'],['future'])
+            with self.assertRaises(AccessDenied):self.store.status(token,self.person,'installation',now=500)
+            proofs.scope(grant,self.person,'installation','@desktop','events',500)
+            self.assertEqual(proofs.scope(grant,self.person,'installation','future','send',104).history_from,100)
+            proofs.scope(grant,self.person,'installation','@desktop','events',104)
+            for conversation,operation,installation in [('missing','send','installation'),('@desktop','send','installation'),('future','send','other')]:
+                with self.assertRaises(AccessDenied):proofs.scope(grant,self.person,installation,conversation,operation,104)
+            with patch.object(self.store,'desktop_conversations',return_value=[]):
+                with self.assertRaises(AccessDenied):proofs.scope(grant,self.person,'installation','future','send',104)
+            self.store.revoke(grant)
+            with self.assertRaises(AccessDenied):proofs.scope(grant,self.person,'installation','@desktop','events',104)
+
     def setUp(self):
         super().setUp()
         self.key=base64.b64encode(ec.generate_private_key(ec.SECP256R1()).public_key().public_bytes(

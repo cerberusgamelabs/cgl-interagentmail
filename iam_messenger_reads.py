@@ -117,4 +117,12 @@ def mark(db, mailbox, ids, history_from=0):
     db.executemany('INSERT OR IGNORE INTO read_events VALUES(?)', [(i,) for i in ids])
     # Keep old clients' reply counters compatible. Notices have their own IDs.
     db.executemany('INSERT OR IGNORE INTO seen VALUES(?)', [(i[:-6],) for i in ids if i.endswith(':reply')])
+    # The same read-through acknowledgement clears the Important Notices entry.
+    # Only acknowledge validated agent events, never infrastructure alerts or
+    # notices beyond the visible anchor / device history grant. Legacy history
+    # stores without a dismissal column have no Important Notices state to clear.
+    if 'dismissed' in {row[1] for row in db.execute('PRAGMA table_info(notices)')}:
+        db.executemany(
+            "UPDATE notices SET dismissed=1 WHERE id=? AND mailbox=? AND kind='agent'",
+            [(i[:-7], mailbox) for i in ids if i.endswith(':notice')])
     return {'unread':len(unread(db,mailbox,history_from))}

@@ -15,6 +15,15 @@ from unittest.mock import patch, MagicMock
 
 
 class WebConnectTests(unittest.TestCase):
+    def test_project_directory_preserves_spaces_and_rejects_unsafe_names(self):
+        client = WebConnectClient(self.config, ConnectorState())
+        valid = ['Nora Bennett', 'Agent', 'Nora.Bennett-2', 'Nora_Bennett']
+        invalid = ['', ' ', '.', '..', '../Nora', 'Nora/Bennett', 'Nora\\Bennett',
+                   'Nora\x00Bennett', 'Nora\nBennett', 'x' * 201, 123]
+        with patch('iam_webconnect.iam.load', return_value={'projects': dict.fromkeys(valid + invalid, {})}), patch('iam_webconnect.iam.profile', return_value={}):
+            self.assertEqual(sorted(valid), client.project_mailboxes())
+            self.assertEqual(sorted(valid), client.mailbox_directory()['mailboxes'])
+
     def test_directory_names_refresh_without_changing_routing(self):
         client = WebConnectClient(self.config, ConnectorState())
         with patch.object(client, 'project_mailboxes', return_value=['Agent']), patch('iam_webconnect.iam.profile', return_value={'display_name': 'Iris'}):

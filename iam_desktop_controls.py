@@ -80,7 +80,7 @@ class SessionControls:
             if hasattr(b, 'statuses'):
                 b.statuses[owner] = ('approval needed' if 'waitingOnApproval' in flags else
                     'input needed' if 'waitingOnUserInput' in flags else
-                    {'active': 'busy', 'idle': 'available', 'notLoaded': 'not attached'}.get(state, 'unavailable'))
+                    {'active': 'busy', 'idle': 'available', 'notLoaded': 'not attached', 'systemError': 'session error'}.get(state, 'unavailable'))
             # Fetch only turn metadata, never transcript items. Recheck for every
             # prepare/confirm so a stale event cannot target a replacement turn.
             known_turn = None
@@ -130,9 +130,14 @@ class SessionControls:
                 raise IAMError('Model catalog pagination did not complete.')
             if action == 'prepare':
                 kind = args.get('kind')
-                if kind not in {'compact', 'stop', 'model', 'plan', 'permissions'}:
+                if kind not in {'compact', 'stop', 'model', 'plan', 'permissions', 'recover'}:
                     raise IAMError('Unsupported control')
-                if kind == 'stop':
+                if kind == 'recover':
+                    if state != 'systemError' or owner not in b.clients:
+                        raise IAMError('Recovery requires this Messenger connection to an errored session.')
+                    params = {'threadId': thread}
+                    method = 'thread/unsubscribe'
+                elif kind == 'stop':
                     if state != 'active' or not known_turn:
                         raise IAMError('No observed active turn to interrupt safely. No action taken.')
                     params = {'threadId': thread, 'turnId': known_turn}
@@ -179,6 +184,9 @@ class SessionControls:
             if ticket['kind'] == 'stop':
                 if state != 'active' or known_turn != ticket['params']['turnId']:
                     raise IAMError('The active turn changed. No different turn was interrupted.')
+            elif ticket['kind'] == 'recover':
+                if state != 'systemError' or b.clients.get(owner) != connection:
+                    raise IAMError('Session or connection changed; no recovery performed.')
             elif state != 'idle':
                 raise IAMError('Session is no longer idle. No action was queued.')
             with b.store.connect() as db:
@@ -186,7 +194,14 @@ class SessionControls:
                     raise IAMError('A previous control has an uncertain result. Review it before submitting another control; ordinary messaging is unaffected.')
                 db.execute('INSERT INTO control_attempts VALUES (?,?,?,?,?)', (ticket_id, thread, ticket['kind'], 'uncertain', time.time()))
             try:
-                await client.request(ticket['method'], ticket['params'])
+                result = await client.request(ticket['method'], ticket['params'])
+                if ticket['kind'] == 'recover':
+                    if result.get('status') not in ('unsubscribed', 'notSubscribed', 'notLoaded'):
+                        raise IAMError('Unsubscribe was not confirmed.')
+                    await client.close()
+                    b.clients.pop(owner, None)
+                    self.turns.pop(owner, None)
+                    b.statuses[owner] = 'not attached'
             except AppServerRpcError:
                 with b.store.connect() as db:
                     db.execute("UPDATE control_attempts SET state='rejected' WHERE id=?", (ticket_id,))
@@ -195,4 +210,6 @@ class SessionControls:
                 raise IAMError('Control result uncertain. No automatic retry. Inspect the session before further control actions.') from None
             with b.store.connect() as db:
                 db.execute("UPDATE control_attempts SET state='accepted' WHERE id=?", (ticket_id,))
-            return {'accepted': True, 'kind': ticket['kind'], 'note': 'Accepted by app-server; completion may follow asynchronously.'}
+            return {'accepted': True, 'kind': ticket['kind'], 'note':
+                    ('Messenger detached only this session. Allow time for it to unload; queued messages remain intact. Other subscribers may prevent unloading.'
+                     if ticket['kind'] == 'recover' else 'Accepted by app-server; completion may follow asynchronously.')}

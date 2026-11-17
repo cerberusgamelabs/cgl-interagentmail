@@ -62,21 +62,22 @@ class PairingReview:
 
     def prepare_invitation(self, token, current_conversations, *, now):
         invitation=self.store.inspect_invitation(token,now=now)
-        if not set(invitation['conversations']).issubset(current_conversations):
+        if not invitation['desktop_scope'] and not set(invitation['conversations']).issubset(current_conversations):
             raise AccessDenied('Conversation list changed; create a new invitation')
         receipt=self.prepare(token, 'buddies', include_history=invitation['history_from']==0,
                              now=now,owner_access=True)
         record=self.tickets[receipt['ticket']]
         record['conversations']=set(invitation['conversations'])
+        record['desktop_scope']=invitation['desktop_scope']
         record['history_from']=invitation['history_from']
-        return dict(receipt,conversations=invitation['conversations'])
+        return dict(receipt,conversations=invitation['conversations'],desktop_scope=invitation['desktop_scope'])
 
     def confirm_invitation(self, ticket, current_conversations, *, now):
         record=self.tickets.pop(ticket,None)
-        if (not record or record['deadline']<=now or not record.get('conversations')
-                or not record['conversations'].issubset(current_conversations)):
+        if (not record or record['deadline']<=now or 'conversations' not in record
+                or (not record.get('desktop_scope') and not record['conversations'].issubset(current_conversations))):
             raise AccessDenied('Review expired or conversations changed')
         self.store.inspect_invitation(record['challenge'],now=now)
         return self.store.approve(record['challenge'],record['principal'],record['installation'],
             record['conversations'],now=now,expires_at=record['expires_at'],
-            history_from=record['history_from'],expected_owner_key=record['owner_key'])
+            history_from=record['history_from'],expected_owner_key=record['owner_key'],desktop_scope=record.get('desktop_scope',False))

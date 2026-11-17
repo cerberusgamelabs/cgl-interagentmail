@@ -157,3 +157,26 @@ class ConsoleModeTests(unittest.TestCase):
             iam.write_atomic(iam.CONFIG, {"windows_hidden_console_port": value})
             with self.assertRaises(IAMError):
                 orchestration.configured_endpoint()
+
+    @unittest.skipUnless(os.name == "nt", "Windows compatibility mode")
+    def test_readiness_timeout_records_live_launch_and_later_reuses_it(self):
+        iam.write_atomic(iam.CONFIG, {"windows_hidden_console_port": 4520})
+        url = 'ws://127.0.0.1:4520'
+        marker = iam.ROOT / 'run' / 'app-server-console-mode.json'
+        old = {'pid': 1234, 'url': 'ws://127.0.0.1:4521'}
+        iam.write_atomic(marker, old)
+        orchestration.pid_path('app-server').write_text('1234\n')
+        with patch.object(orchestration, 'appserver_available', new=AsyncMock(return_value=False)), \
+             patch.object(orchestration, 'spawn_background', return_value=9876), \
+             patch.object(orchestration, 'codex_executable', return_value='codex'), \
+             patch.object(orchestration, 'pid_alive', side_effect=lambda pid: pid == 9876):
+            with self.assertRaisesRegex(SystemExit, 'Ownership was retained'):
+                orchestration.ensure_appserver(url, wait_seconds=0)
+        self.assertEqual({'pid': 9876, 'url': url}, iam.load(marker))
+        self.assertEqual(old, iam.load(marker.with_name('app-server-previous-ownership.json')))
+        self.assertEqual(9876, orchestration.read_pid('app-server'))
+        with patch.object(orchestration, 'appserver_available', new=AsyncMock(return_value=True)), \
+             patch.object(orchestration, 'pid_alive', side_effect=lambda pid: pid == 9876), \
+             patch.object(orchestration, 'spawn_background') as spawn:
+            self.assertEqual('already running', orchestration.ensure_appserver(url))
+        spawn.assert_not_called()

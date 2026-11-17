@@ -15,7 +15,7 @@ export function buddyKey(value){return value?.installation && value?.conversatio
 export function buddySnapshot(value){return Object.fromEntries(fields.filter(k=>value[k]!==undefined).map(k=>[k,value[k]]));}
 export function rememberBuddy(list,value){
   const id=buddyKey(value);if(!id)return list;
-  if(list.length>=64 && !list.some(item=>buddyKey(item)===id))throw new Error('This pilot supports up to 64 saved conversations.');
+  if(list.length>=1024 && !list.some(item=>buddyKey(item)===id))throw new Error('This pilot supports up to 1024 saved conversations.');
   const next=list.filter(item=>buddyKey(item)!==id);next.push(buddySnapshot(value));return next;
 }
 export function selectBuddy(state,buddy){
@@ -32,10 +32,13 @@ export function restoreAfterLogin(saved,origin,session,fingerprint){
   const next=structuredClone(saved);
   delete next.session;
   if(saved.session.deviceId!==session.deviceId){
+    delete next.friendPush;
+    delete next.avatarCache;
     for(const value of [next,...(next.buddies || [])]){
       for(const field of ['grantId','grantExpires','pairing','push'])delete value[field];
     }
     delete next.accountPairing;
+    delete next.desktopLinks;
   }
   return next;
 }

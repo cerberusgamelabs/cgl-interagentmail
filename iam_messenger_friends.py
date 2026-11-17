@@ -34,7 +34,7 @@ def main():
     from pathlib import Path
     from iam_service import mailbox_service
     parser=argparse.ArgumentParser(description='Intentional external friendship operations; never owner authorization')
-    parser.add_argument('operation',choices=['self','roster','invite','discover','request','decide','send','history','read','inbox','attachment'])
+    parser.add_argument('operation',choices=['self','roster','invite','discover','request','decide','send','history','read','inbox','attachment','delivery_settings'])
     parser.add_argument('--mailbox')
     parser.add_argument('--value-file',help='UTF-8 JSON operation fields; avoids shell quoting for messages')
     args=parser.parse_args()
@@ -57,7 +57,7 @@ def friend_operation(service, operation, value, *, internal=False):
     from iam_webconnect import load_config
     from iam_desktop import DesktopStore
     from iam_messenger_consent import ExternalContactReview
-    allowed={'self','roster','invite','discover','request','decide','send','history','read','inbox','attachment'}
+    allowed={'self','roster','invite','discover','request','decide','send','history','read','inbox','attachment','delivery_settings'}
     if internal:allowed.add('receipt')
     if operation not in allowed:
         raise IAMError('Unsupported friend operation')
@@ -67,6 +67,28 @@ def friend_operation(service, operation, value, *, internal=False):
     review=ExternalContactReview(DesktopStore())
     policy=review.status(service.address,config)
     if not policy['permitted']:raise IAMError('Current owner permission is required')
+    if operation=='delivery_settings':
+        # Local only. Never accept sender-supplied mailbox, peer kind or scope.
+        import uuid
+        from iam_messenger_friend_delivery import FriendQueue
+        if not isinstance(value,dict) or set(value) not in ({'id'},{'id','daily_limit','cooldown_seconds','paused','revision'}):
+            raise IAMError('Use id to inspect, or id plus all delivery settings and current revision to update')
+        try:
+            if not isinstance(value['id'],str) or str(uuid.UUID(value['id']))!=value['id']:raise ValueError()
+        except (ValueError,TypeError,AttributeError):raise IAMError('A canonical conversation UUID is required') from None
+        roster=friend_operation(service,'roster',{})
+        relationship=next((r for r in roster['relationships'] if r['id']==value['id'] and r['state']=='active'),None)
+        if not relationship:raise IAMError('An active friendship belonging to your mailbox is required')
+        current_config=load_config()
+        if review.status(service.address,current_config)!=policy:
+            raise IAMError('Permission changed; inspect again')
+        scope=review.scope(current_config)[0]
+        result=FriendQueue().settings(service.address,value['id'],relationship['peer']['kind'],scope=scope,
+            updates={k:v for k,v in value.items() if k!='id'} if len(value)>1 else None)
+        return dict(result,scope='local incoming deliveries only',unit='delivery turns per rolling 24 hours',
+                    defaults={'human_daily_limit':20,'agent_daily_limit':4,'cooldown_seconds':300},
+                    bounds={'daily_limit':[1,1000],'cooldown_seconds':[0,86400]},
+                    note='Owner consent, revocation, sleep and uncertainty holds still apply. Settings do not resend seen messages or cancel accepted turns.')
     url=urlsplit(config['server_url'])
     if url.scheme!='wss' or not url.hostname or url.username or url.password or url.query or url.fragment:
         raise IAMError('A configured secure relay is required')

@@ -30,6 +30,8 @@ class RestartReleaseTests(unittest.TestCase):
             record.write_text('123\n')
             with (
                 patch('iam_desktop.control', return_value=False),
+                patch.object(o, 'stop_webconnect'),
+                patch.object(o, 'cmd_web_stop'),
                 patch.object(o, 'read_pid', return_value=123),
                 patch.object(o, 'pid_alive', return_value=False),
                 patch.object(o, 'configured_endpoint', return_value='ws://127.0.0.1:4500'),
@@ -46,3 +48,31 @@ class RestartReleaseTests(unittest.TestCase):
                 release.side_effect = None
                 o.cmd_stop(argparse.Namespace(all=True))
                 self.assertFalse(record.exists())
+
+    def test_all_stops_companions_before_server_without_disabling_connector(self):
+        events = []
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('iam_desktop.control', return_value=False), \
+             patch.object(o, 'read_pid', side_effect=lambda name: {'supervisor': 1, 'app-server': 2}[name]), \
+             patch.object(o, 'pid_alive', return_value=True), \
+             patch.object(o, 'stop_process', side_effect=lambda pid, **kw: events.append(pid)), \
+             patch.object(o, 'stop_webconnect', side_effect=lambda **kw: events.append(('connect', kw))) as connector, \
+             patch.object(o, 'cmd_web_stop', side_effect=lambda args: events.append('web')), \
+             patch.object(o, 'configured_endpoint', return_value='ws://127.0.0.1:4520'), \
+             patch.object(o, 'load_config', return_value={'windows_hidden_console_port': 4520}), \
+             patch.object(o, 'wait_compatibility_port_release'), \
+             patch.object(o, 'pid_path', return_value=Path(temp) / 'absent.pid'):
+            o.cmd_stop(argparse.Namespace(all=True))
+        self.assertEqual([1, ('connect', {'disable': False}), 'web', 2], events)
+        connector.assert_called_once_with(disable=False)
+
+    def test_coordinated_connector_stop_preserves_preferences(self):
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(o, 'read_pid', return_value=123), \
+             patch.object(o, 'pid_alive', return_value=True), \
+             patch.object(o, 'stop_process') as stop, \
+             patch.object(o, 'save_webconnect_config') as save, \
+             patch.object(o, 'pid_path', return_value=Path(temp) / 'absent.pid'):
+            o.stop_webconnect(disable=False)
+        stop.assert_called_once_with(123, tree=True)
+        save.assert_not_called()

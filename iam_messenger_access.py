@@ -60,6 +60,8 @@ def authorize(*, enabled: bool, principal: Principal | None,
         raise AccessDenied('Pairing expired or revoked')
     if not conversation_id or conversation_id not in grant.conversation_ids:
         raise AccessDenied('Conversation not granted')
+    if conversation_id == '@desktop' and operation != 'events':
+        raise AccessDenied('Desktop discovery is not a conversation')
     return grant
 
 

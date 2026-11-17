@@ -41,6 +41,17 @@ class Pairings:
                     db.execute(f'ALTER TABLE {table} ADD COLUMN owner_key TEXT')
             if 'grant_id' not in {r['name'] for r in db.execute('PRAGMA table_info(pairing_requests)')}:
                 db.execute('ALTER TABLE pairing_requests ADD COLUMN grant_id TEXT')
+            for table in ('pairing_invitations', 'pairing_grants'):
+                if 'desktop_scope' not in {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}:
+                    db.execute(f'ALTER TABLE {table} ADD COLUMN desktop_scope INTEGER NOT NULL DEFAULT 0')
+
+    @staticmethod
+    def desktop_conversations():
+        from iam_orchestrator import registered_projects
+        names=sorted(registered_projects())
+        if len(names)>1024 or any(not isinstance(c,str) or not c or len(c)>512 or c=='@desktop' for c in names):
+            raise AccessDenied('Desktop roster exceeds supported bounds')
+        return names
 
     @contextmanager
     def connection(self):
@@ -84,14 +95,15 @@ class Pairings:
                        (self.digest(challenge), identity, installation, now + 300, owner_key))
         return challenge
 
-    def invite(self, home, account, installation, conversations, *, include_history, now):
+    def invite(self, home, account, installation, conversations, *, include_history, now, desktop_scope=False):
         """Trusted Desktop only. The invitation is NOT a grant or login token."""
         self.identity(Principal(home, account, 'local-review', 'messenger_device'))
         if (not isinstance(installation, str) or not installation or len(installation)>512
                 or type(include_history) is not bool or not isinstance(conversations, (set, frozenset))
-                or not 1<=len(conversations)<=64
+                or type(desktop_scope) is not bool
+                or not (0 if desktop_scope else 1)<=len(conversations)<=(1024 if desktop_scope else 64)
                 or any(not isinstance(c,str) or not c or len(c)>512 for c in conversations)):
-            raise AccessDenied('Select between one and 64 current conversations')
+            raise AccessDenied('Invalid invitation scope or desktop roster exceeds supported bounds')
         token=secrets.token_urlsafe(32)
         with self.connection() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -99,10 +111,10 @@ class Pairings:
             db.execute('DELETE FROM pairing_requests WHERE expires<=?', (now,))
             if db.execute('SELECT count(*) FROM pairing_invitations').fetchone()[0]>=20:
                 raise AccessDenied('Too many pairing invitations')
-            db.execute('INSERT INTO pairing_invitations VALUES (?,?,?,?,?,?,?,0)',
-                (self.digest(token),home,account,installation,json.dumps(sorted(conversations)),0 if include_history else now,now+300))
+            db.execute('INSERT INTO pairing_invitations (digest,home,account,installation,conversations,history_from,expires,cancelled,desktop_scope) VALUES (?,?,?,?,?,?,?,0,?)',
+                (self.digest(token),home,account,installation,json.dumps(sorted(conversations)),0 if include_history else now,now+300,int(desktop_scope)))
         return dict(challenge=token,expires_at=now+300,installation=installation,
-                    home=home,account=account,conversations=sorted(conversations),include_history=include_history)
+                    home=home,account=account,conversations=sorted(conversations),include_history=include_history,desktop_scope=desktop_scope)
 
     def claim_invitation(self, token, principal, installation, owner_key, *, now):
         """Authenticated phone claims once; retries by that exact key are idempotent."""
@@ -132,7 +144,7 @@ class Pairings:
         if not row or row['cancelled'] or row['expires']<=now:
             raise AccessDenied('Invitation expired or cancelled')
         return dict(conversations=json.loads(row['conversations']),history_from=row['history_from'],
-                    expires_at=row['expires'],installation=row['installation'])
+                    expires_at=row['expires'],installation=row['installation'],desktop_scope=bool(row['desktop_scope']))
 
     def cancel_invitation(self, token):
         with self.connection() as db:
@@ -145,13 +157,14 @@ class Pairings:
             db.execute('DELETE FROM pairing_requests WHERE digest=?',(digest,))
 
     def approve(self, challenge, expected_principal, installation, conversations,
-                *, now, expires_at, history_from, expected_owner_key=None):
+                *, now, expires_at, history_from, expected_owner_key=None, desktop_scope=False):
         """Local-only: expected identity must match what the owner confirmed."""
         identity = self.identity(expected_principal)
         if (type(expires_at) is not int or not now < expires_at <= now + 30 * 86400
                 or type(history_from) is not int or not 0 <= history_from <= now
                 or not isinstance(conversations, (set, frozenset))
-                or not 1 <= len(conversations) <= 100
+                or type(desktop_scope) is not bool or (desktop_scope and not expected_owner_key)
+                or not (0 if desktop_scope else 1) <= len(conversations) <= (1024 if desktop_scope else 100)
                 or any(not isinstance(c, str) or not c or len(c) > 512 for c in conversations)):
             raise AccessDenied('Invalid grant scope or duration')
         with self.connection() as db:
@@ -164,13 +177,14 @@ class Pairings:
                 raise AccessDenied('Pairing request expired, consumed or mismatched')
             invitation=db.execute('SELECT * FROM pairing_invitations WHERE digest=?',(self.digest(challenge),)).fetchone()
             if invitation and (invitation['cancelled'] or invitation['expires']<=now
+                    or bool(invitation['desktop_scope'])!=desktop_scope
                     or set(json.loads(invitation['conversations']))!=conversations
                     or invitation['history_from']!=history_from):
                 raise AccessDenied('Invitation review scope changed')
             grant_id = secrets.token_urlsafe(32)
-            db.execute('INSERT INTO pairing_grants (id, identity, installation, conversations, expires, history_from, owner_key) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            db.execute('INSERT INTO pairing_grants (id, identity, installation, conversations, expires, history_from, owner_key, desktop_scope) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
                        (grant_id, identity, installation, json.dumps(sorted(conversations)),
-                        expires_at, history_from, expected_owner_key))
+                        expires_at, history_from, expected_owner_key,int(desktop_scope)))
             db.execute('UPDATE pairing_requests SET consumed = 1, grant_id = ? WHERE digest = ?',
                        (grant_id, self.digest(challenge)))
         return grant_id
@@ -197,7 +211,8 @@ class Pairings:
                     or not grant['owner_key'] or grant['owner_key'] != row['owner_key']):
                 raise AccessDenied('Pairing unavailable')
             return dict(state='approved', grant_id=grant['id'], expires_at=grant['expires'],
-                        conversations=json.loads(grant['conversations']))
+                        conversations=self.desktop_conversations() if grant['desktop_scope'] else json.loads(grant['conversations']),
+                        desktop_scope=bool(grant['desktop_scope']))
 
     def inspect(self, challenge, *, now):
         """Local-only preview. Never return the stored challenge digest."""
@@ -216,7 +231,7 @@ class Pairings:
         if row is None or row['identity'] != identity or row['revoked'] or row['expires'] <= now:
             raise AccessDenied('Pairing unavailable')
         return OwnerGrant(principal.home_server, principal.account_id, principal.device_id,
-                          row['installation'], frozenset(json.loads(row['conversations'])),
+                          row['installation'], frozenset(self.desktop_conversations()+['@desktop'] if row['desktop_scope'] else json.loads(row['conversations'])),
                           row['expires'], row['history_from'], owner_key=row['owner_key'])
 
     def revoke(self, grant_id):
@@ -231,10 +246,10 @@ class Pairings:
         result = []
         for row in rows:
             conversations = json.loads(row['conversations'])
-            if conversation is None or conversation in conversations:
+            if conversation is None or conversation in conversations or row['desktop_scope']:
                 result.append(dict(grant_id=row['id'],principal=json.loads(row['identity']),
                     conversations=conversations,installation=row['installation'],expires_at=row['expires'],
-                    fingerprint=fingerprint(row['owner_key']) if row['owner_key'] else None))
+                    fingerprint=fingerprint(row['owner_key']) if row['owner_key'] else None,desktop_scope=bool(row['desktop_scope'])))
             if len(result) == 100:
                 break
         return result

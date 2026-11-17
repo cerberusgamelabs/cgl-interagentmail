@@ -3,7 +3,7 @@ const paths=new Set(['/v1/auth/register','/v1/auth/resend','/v1/auth/forgot','/v
   '/v1/messenger/friends/self','/v1/messenger/friends/roster','/v1/messenger/friends/invite',
   '/v1/messenger/friends/discover','/v1/messenger/friends/request','/v1/messenger/friends/decide',
   '/v1/messenger/friends/send','/v1/messenger/friends/history','/v1/messenger/friends/read',
-  '/v1/messenger/friends/listen','/v1/messenger/friends/attachment','/v1/messenger/friends/typing',
+  '/v1/messenger/friends/listen','/v1/messenger/friends/attachment','/v1/messenger/friends/typing','/v1/messenger/friends/notifications',
   '/v1/messenger/events/challenge','/v1/messenger/events/sync',
   '/v1/messenger/pairing/status','/v1/messenger/pairing/claim','/v1/messenger/history/challenge','/v1/messenger/history/read',
   '/v1/messenger/send/challenge','/v1/messenger/send/submit',

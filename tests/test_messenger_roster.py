@@ -6,9 +6,25 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from tests import test_messenger_images as images
 from iam_messenger_connector import events_request
 from iam_messenger_stream import ForegroundStreams
+from unittest.mock import patch
 
 class RosterTests(unittest.TestCase):
     setUp=images.ImageTests.setUp
+
+    def test_signed_desktop_discovery_denies_legacy_and_returns_current_names_only(self):
+        frame=self.frame | dict(type='messenger_events_challenge',conversation_id='@desktop',content=base64.b64encode(b'{"read":[]}').decode())
+        self.assertIn('error',events_request(frame,self.config,self.store,self.path,now=120))
+        # Synthetic explicit local upgrade, never mutate a production grant.
+        with self.store.connection() as db:db.execute('UPDATE pairing_grants SET desktop_scope=1 WHERE id=?',(self.grant,))
+        with patch.object(self.store,'desktop_conversations',return_value=['new-agent']), patch('iam_messenger_connector.conversation_name',return_value='New agent'):
+            proof=events_request(frame,self.config,self.store,self.path,now=120)
+            self.assertNotIn('error',proof)
+            frame.update(type='messenger_events_sync',nonce=proof['nonce'],signature=base64.b64encode(self.key.sign(base64.b64decode(proof['payload']),ec.ECDSA(hashes.SHA256()))).decode())
+            result=events_request(frame,self.config,self.store,self.path,now=120)
+            self.assertEqual(result['desktop_roster'],[{'conversation':'new-agent','display_name':'New agent'}])
+            self.assertEqual(result['subscriptions'],[])
+            self.assertNotIn('profile',result)
+            self.assertIn('error',events_request(frame,self.config,self.store,self.path,now=120))
 
     def query(self,roster,listen=None,streams=None):
         value=dict(read=[],roster=roster)

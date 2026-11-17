@@ -7,7 +7,7 @@ import {uploadImage,downloadImage} from './images.mjs';
 import {imagePreviews} from './image-grid.mjs';
 const previews=imagePreviews({document});
 import {fitDraft} from './composer.mjs';
-import {parseInvitation,enrollConversations} from './pairing.mjs';
+import {parseInvitation,enrollConversations,mergeDesktopRoster} from './pairing.mjs';
 import {LiveConversation} from './live.mjs';
 import {downloadText} from './full-text.mjs';
 import {downloadDocument} from './documents.mjs';
@@ -16,6 +16,9 @@ import {packState,unpackState} from './protected-state.mjs';
 import {publicProfile,downloadAvatar} from './profiles.mjs';
 import {installEdgeBack} from './edge-back.mjs';
 import {createFriendships} from './friendships.mjs';
+import {activeFriendBuddies} from './friend-buddies.mjs';
+import {friendNotifications} from './friend-notifications.mjs';
+import {cachedAvatar,rememberAvatar} from './avatar-cache.mjs';
 const native=registerPlugin('OwnerDevice');
 const $=id=>document.getElementById(id);
 let transport=null,state=null,key=null,busy=false,cursor=[0,''];
@@ -29,11 +32,16 @@ let live=null,queuedLive=false;
 const profiles=new Map(),avatars=new Map();
 let avatarBusy=false;
 let friendUI=null;
-$('openFriends').onclick=()=>run(async()=>{
+let friendBuddies=[],friendSession=null;
+let friendNotificationFailed=false;
+const friendAlerts=friendNotifications({getTransport:()=>transport,getState:()=>state,native,save,document,
+  status:failed=>{friendNotificationFailed=failed;drawNotificationStatus();}});
+async function openFriends(id){
   await leaveConversation('home');
-  friendUI ||= createFriendships({dialog:$('friendships'),getTransport:()=>transport,getState:()=>state,save,document,onScope:updateLive,native});
-  await friendUI.open();
-});
+  friendUI ||= createFriendships({dialog:$('friendships'),getTransport:()=>transport,getState:()=>state,save,document,enableNotifications:()=>friendAlerts.enable(),onScope:()=>{updateLive();if(!$('friendships').open)refreshFriendSummary();},native});
+  await friendUI.open(id);
+}
+$('openFriends').onclick=()=>run(()=>openFriends());
 function drawProfile(){
   const id=buddyKey(state),profile=profiles.get(id);
   $('chatAvatar').textContent=buddyName(state).slice(0,1) || '?';
@@ -48,6 +56,8 @@ function drawProfile(){
 }
 async function refreshAvatar(buddy){
   const id=buddyKey(buddy),meta=profiles.get(id)?.avatar;
+  const cached=cachedAvatar(state,id,buddy.grantId,meta?.sha256);
+  if(cached){avatars.set(id,cached);drawProfile();drawBuddies();return;}
   if(avatarBusy || !meta || avatars.get(id)?.sha256===meta.sha256 || document.hidden || !['chat','home'].includes(screen) || screen==='chat' && buddyKey(state)!==id)return;
   const current=transport,view=screen;
   const check=()=>{if(current!==transport || !current?.session || screen!==view || document.hidden || !state.buddies.some(b=>buddyKey(b)===id && b.grantId===buddy.grantId))throw Error('Profile view changed');};
@@ -57,7 +67,8 @@ async function refreshAvatar(buddy){
       const value=await current.attachment(buddy.installation,buddy.conversation,buddy.grantId,query,async(bytes,intent)=>{check();return nativeSigner(native)(bytes,intent);});check();return value;
     });
     if(!document.hidden && screen===view && current===transport && profiles.get(id)?.avatar?.sha256===meta.sha256){
-      avatars.set(id,{sha256:meta.sha256,uri:`data:${image.mime};base64,${image.data}`});drawProfile();drawBuddies();
+      const cached={sha256:meta.sha256,uri:`data:${image.mime};base64,${image.data}`};
+      avatars.set(id,cached);rememberAvatar(state,id,buddy.grantId,cached);await save();drawProfile();drawBuddies();
     }
   }catch{/* No broken photo or stale profile is published; retry on later sync. */}
   finally{avatarBusy=false;}
@@ -78,6 +89,11 @@ function updateLive(){
     live.setScope({key:JSON.stringify(['friends',session.deviceId]),origin:transport.origin,token:session.token,transport,friends:true});return;
   }
   const groups=rosterGroups();
+  if(screen==='home' && groups.some((g,i)=>groups.findIndex(other=>other.installation===g.installation)!==i)){
+    // A local foreground lease covers one bounded roster per installation.
+    // Large desktops rotate metadata batches instead of replacing that lease repeatedly.
+    live.setScope(null);drawLiveStatus();return;
+  }
   if(screen==='home' && !groups.length && session && !document.hidden){
     live.setScope({key:JSON.stringify(['friends',session.deviceId]),origin:transport.origin,token:session.token,transport,friends:true});return;
   }
@@ -95,8 +111,26 @@ function rosterGroups(){
     if(!groups.has(buddy.installation))groups.set(buddy.installation,[]);
     groups.get(buddy.installation).push({conversation:buddy.conversation,grant:buddy.grantId});
   }
-  return [...groups].map(([installation,roster])=>({installation,roster}));
+  return [...groups].flatMap(([installation,roster])=>Array.from({length:Math.ceil(roster.length/64)},(_,i)=>({installation,roster:roster.slice(i*64,(i+1)*64)})));
 }
+async function refreshDesktopLinks(){
+  const current=transport,session=current?.session;
+  for(const link of state?.desktopLinks || []){
+    if(!session || current!==transport || current.session!==session || document.hidden || screen!=='home')return;
+    if(link.grantExpires*1000<=Date.now())continue;
+    let result;
+    try{result=await current.syncEvents(link.installation,'@desktop',link.grantId,[],nativeSigner(native));}
+    catch{
+      if(current===transport && current.session===session && screen==='home' && !document.hidden)
+        message('A desktop link could not refresh. Saved conversations are kept; check that desktop is connected.');
+      continue;
+    }
+    if(current!==transport || current.session!==session || document.hidden || screen!=='home')return;
+    const next=mergeDesktopRoster(state,link,result.desktopRoster);
+    if(JSON.stringify(next)!==JSON.stringify(state)){state=next;await save();drawBuddies();}
+  }
+}
+let homeRosterCursor=0;
 async function refreshRoster(groups=rosterGroups(),listen=null,current=transport){
   let stream=null,renamed=false;
   for(const group of groups){
@@ -121,13 +155,13 @@ async function refreshFriendSummary(){
   const current=transport,session=current?.session;if(!session || document.hidden || screen!=='home' || $('friendships').open)return;
   try{const roster=await current.friends('roster');
     if(current!==transport || session!==current.session || document.hidden || screen!=='home' || $('friendships').open)return;
-    if(!Array.isArray(roster.relationships) || roster.relationships.length>200)return;
+    friendBuddies=activeFriendBuddies(roster);friendSession=session;drawBuddies();
     const requests=roster.relationships.filter(r=>r.state==='pending' && r.incoming).length;
     const unread=roster.relationships.reduce((n,r)=>n+(Number.isSafeInteger(r.unread)&&r.unread>0?Math.min(2000,r.unread):0),0);
     $('openFriends').textContent='Friends and invitations'+(requests||unread?` (${requests} requests, ${unread} unread)`:'');
-  }catch{/* Default-off or unavailable friendship service does not break owner chat. */}
+  }catch{if(current===transport && session===current?.session){friendBuddies=[];friendSession=null;drawBuddies();}}
 }
-async function refreshLive(){queuedLive=false;if(screen==='home'){await refreshRoster();await refreshFriendSummary();return;}await loadHistory();await syncUnread({...state});}
+async function refreshLive(){queuedLive=false;if(screen==='home'){await refreshDesktopLinks();await refreshRoster();await refreshFriendSummary();return;}await loadHistory();await syncUnread({...state});}
 let openedImage=null;
 function closeImage(){openedImage=null;if($('imageViewer').open)$('imageViewer').close();$('viewImage').src='';}
 $('closeImage').onclick=closeImage;
@@ -139,6 +173,8 @@ $('saveImage').onclick=()=>run(async()=>{
 },{preserveComposer:true});
 function closeText(){if($('textViewer').open)$('textViewer').close();$('fullText').textContent='';}
 $('closeText').onclick=closeText;
+const copyFull=document.createElement('button');copyFull.textContent='Copy full message';
+copyFull.onclick=()=>run(async()=>{await native.copyText({text:$('fullText').textContent});message('Full message copied.');},{preserveComposer:true});$('textViewer').append(copyFull);
 $('textViewer').addEventListener('close',()=>{$('fullText').textContent='';});
 async function openFullText(item){
   const selected=buddyKey(state),grant=state.grantId,currentTransport=transport;
@@ -186,6 +222,41 @@ async function uploadPending(pending){
 const views=new Map();
 const unreadCounts=new Map();
 let readTracker=null,readTrackerKey='',unreadCursor=0,unreadBusy=false,pushToken=null;
+const notificationFailures=new Set();
+let notificationSession=null,notificationCursor=0;
+function drawNotificationStatus(){
+  if(notificationSession!==transport?.session){notificationFailures.clear();notificationSession=transport?.session;}
+  const opted=(state?.buddies || []).filter(b=>b.push);
+  const expired=opted.some(b=>!b.grantId || !(b.grantExpires*1000>Date.now()));
+  const failed=opted.some(b=>notificationFailures.has(buddyKey(b)));
+  $('notificationNotice').hidden=!transport?.session || !(expired || failed || friendNotificationFailed);
+  $('notificationNotice').textContent=expired?
+    'Some notification permissions have expired. Renew the affected conversation pairing to restore alerts.':
+    friendNotificationFailed?'Friend notification registration could not be refreshed. Friend alerts may be unavailable; Messenger will retry while open.':
+    'Notification registration could not be refreshed. Background alerts may be unavailable. Check Android notification settings and your connection; Messenger will retry while open.';
+}
+async function renewHomeNotifications(){
+  drawNotificationStatus();
+  const current=transport,session=current?.session;
+  const buddies=(state?.buddies || []).filter(b=>b.push && b.grantId && b.grantExpires*1000>Date.now());
+  if(document.hidden || !session || !buddies.length)return;
+  const buddy={...buddies[notificationCursor++ % buddies.length]},id=buddyKey(buddy);
+  const valid=()=>transport===current && current.session===session && !document.hidden &&
+    state?.buddies?.some(b=>buddyKey(b)===id && b.grantId===buddy.grantId && b.push?.id===buddy.push.id);
+  try{
+    const {token}=await native.refreshNotificationToken();
+    if(!valid())return;
+    if(typeof token!=='string' || !token)throw Error('Notification token unavailable');
+    await native.registerNotificationScope({id:buddy.push.id,expires:Math.min(buddy.grantExpires,Math.floor(session.expiresAt/1000))});
+    if(!valid())return;
+    await current.syncEvents(buddy.installation,buddy.conversation,buddy.grantId,[],async(bytes,intent)=>{
+      if(!valid())throw Error('Notification scope changed');
+      return nativeSigner(native)(bytes,intent);
+    },{id:buddy.push.id,token});
+    if(valid())notificationFailures.delete(id);
+  }catch{if(valid())notificationFailures.add(id);}
+  finally{drawNotificationStatus();}
+}
 async function syncUnread(buddy,ids=[]) {
   const currentTransport=transport;
   const signer=async(bytes,intent)=>{
@@ -230,22 +301,26 @@ async function checkVisibleReads() {
 }
 async function checkUnreadCounts() {
   if(document.hidden || unreadBusy || busy || !transport?.session)return;
+  await friendAlerts.refresh();
+  if(document.hidden || unreadBusy || busy || !transport?.session)return;
+  drawNotificationStatus();
   if(screen==='home'){
-    if(live?.connected)return;
-    unreadBusy=true;try{await refreshRoster();}catch{/* Keep cached labels; subscription retries independently. */}finally{unreadBusy=false;}return;
+    unreadBusy=true;try{await renewHomeNotifications();await refreshDesktopLinks();await refreshFriendSummary();if(!live?.connected){const groups=rosterGroups();if(groups.length)await refreshRoster([groups[homeRosterCursor++ % groups.length]]);}}catch{/* Subscription retries independently. */}finally{unreadBusy=false;}return;
   }
   const buddies=(state?.buddies || []).filter(b=>b.grantId && b.grantExpires*1000>Date.now());
   if(!buddies.length)return;
   unreadBusy=true;
   const buddy=buddies[unreadCursor++ % buddies.length];
   try{
-    if(buddy.push){try{pushToken=(await native.refreshNotificationToken()).token;}catch{pushToken=null;}}
+    if(buddy.push){try{pushToken=(await native.refreshNotificationToken()).token;}catch{pushToken=null;notificationFailures.add(buddyKey(buddy));}}
     await syncUnread(buddy);
-  }catch{unreadCounts.delete(buddyKey(buddy));drawBuddies();}
-  finally{unreadBusy=false;}
+    if(buddy.push && pushToken)notificationFailures.delete(buddyKey(buddy));
+  }catch{if(buddy.push)notificationFailures.add(buddyKey(buddy));unreadCounts.delete(buddyKey(buddy));drawBuddies();}
+  finally{unreadBusy=false;drawNotificationStatus();}
 }
 function drawBuddies(){
   $('buddies').replaceChildren();
+  if(!transport?.session || friendSession!==transport.session){friendBuddies=[];friendSession=null;}
   const buddies=state?.buddies || [],filter=$('buddySearch').value.trim().toLocaleLowerCase();
   let shown=0;
   for(const buddy of buddies){
@@ -253,7 +328,7 @@ function drawBuddies(){
     shown++;
     const button=document.createElement('button');
     const expired=buddy.grantExpires && buddy.grantExpires*1000<=Date.now();
-    button.className='buddy';
+    button.className='buddy buddy-owner';
     const picture=avatars.get(buddyKey(buddy)),profile=profiles.get(buddyKey(buddy));
     const avatar=document.createElement(picture && picture.sha256===profile?.avatar?.sha256?'img':'span');avatar.className='buddy-avatar';
     if(picture && picture.sha256===profile?.avatar?.sha256){avatar.src=picture.uri;avatar.alt='';}
@@ -269,9 +344,20 @@ function drawBuddies(){
     button.disabled=busy;
     button.onclick=()=>run(()=>switchBuddy(buddy));$('buddies').append(button);
   }
-  $('buddySummary').textContent=`${buddies.length} saved conversation${buddies.length===1?'':'s'}`;
+  for(const friend of friendBuddies){
+    if(filter && !friend.name.toLocaleLowerCase().includes(filter))continue;
+    shown++;
+    const button=document.createElement('button');button.className='buddy buddy-friend';button.disabled=busy;
+    const avatar=document.createElement('span');avatar.className='buddy-avatar';avatar.textContent=Array.from(friend.name)[0].toLocaleUpperCase();
+    const info=document.createElement('span');info.className='buddy-info';
+    const name=document.createElement('strong');name.textContent=friend.name;
+    const detail=document.createElement('small');detail.textContent='Friend conversation';info.append(name,detail);
+    const badge=document.createElement('span');badge.className='buddy-unread';badge.textContent=friend.unread?`${friend.unread} unread`:'';
+    button.append(avatar,info,badge);button.onclick=()=>run(()=>openFriends(friend.id));$('buddies').append(button);
+  }
+  $('buddySummary').textContent=`${buddies.length} linked conversation${buddies.length===1?'':'s'} · ${friendBuddies.length} friend${friendBuddies.length===1?'':'s'}`;
   $('emptyBuddies').hidden=shown>0;
-  $('emptyBuddies').textContent=buddies.length?'No matching saved conversations.':'No linked conversations yet. Link your desktop to get started.';
+  $('emptyBuddies').textContent=buddies.length || friendBuddies.length?'No matching conversations.':'No conversations yet. Open Friends and invitations to connect with a friend, or link your own desktop for owner access.';
   $('activeConversation').textContent=state?.conversation?`Conversation: ${buddyName(state)}`:'Choose or pair a conversation';
 }
 async function switchBuddy(buddy){
@@ -340,6 +426,7 @@ function message(value,error=false){$('status').textContent=value;$('helpStatus'
   if(error && screen==='chat'){$('connectionNotice').textContent=value;$('connectionNotice').hidden=false;}
 }
 function render(){
+  drawNotificationStatus();
   const chat=screen==='chat' && !!state?.grantId;
   document.body.classList.toggle('chat-ready',chat);
   drawBuddies();
@@ -406,13 +493,20 @@ async function run(work,{preserveComposer=work===loadHistory || work===loadOlder
     if(queued && !failures && screen==='chat' && !document.hidden && queued===buddyKey(state) && $('messages').scrollTop<=48 && hasOlder)await run(loadOlder);
       if(queuedLive && !failures && ['chat','home'].includes(screen) && !document.hidden)await run(refreshLive,{preserveComposer:true});
   }}
-$('loginForm').onsubmit=e=>{e.preventDefault();run(async()=>{
+function setPasswordVisible(visible){
+  $('password').type=visible?'text':'password';
+  $('togglePassword').textContent=visible?'Hide':'Show';
+  $('togglePassword').ariaLabel=visible?'Hide password':'Show password';
+}
+$('togglePassword').onclick=()=>setPasswordVisible($('password').type!=='text');
+$('loginForm').onsubmit=e=>{e.preventDefault();setPasswordVisible(false);run(async()=>{
   screen='home';unreadCounts.clear();pushToken=null;readTrackerKey='';historyLoaded=false;olderCursor=null;hasOlder=false;
   const origin=$('origin').value.trim();
   const retained=state?{...state,session:transport?.session || state.session}:expiredState;
   transport=new MessengerTransport(origin,{fetchImpl:nativeFetch(native,origin),timeoutMs:35000});
   friendUI?.clear();clearTimeout(draftTimer);await saveQueue.catch(()=>{});expiredState=retained;state=null;views.clear();profiles.clear();avatars.clear();$('messages').replaceChildren();cursor=[0,''];events=[];$('draft').value='';
-  try{await transport.login($('email').value.trim(),$('password').value,'IAM Android');}finally{$('password').value='';}
+  const previousToken=retained?.origin===transport.origin && retained?.keyFingerprint===key.fingerprint ? retained.session?.token : null;
+  try{await transport.login($('email').value.trim(),$('password').value,'IAM Android',previousToken);}finally{$('password').value='';}
   state=restoreAfterLogin(retained,transport.origin,transport.session,key.fingerprint);
   try{await save();expiredState=null;}catch(e){state=null;await transport.logout().catch(()=>{});throw e;}
   message(state.buddies?.length?'Signed in. Saved contacts and drafts restored. Link Desktop again to approve this login where needed.':'Signed in. Link your desktop from the buddy list to get started.');
@@ -458,7 +552,7 @@ $('request').onclick=()=>run(async()=>{
   if(state.pairing)throw new Error('Pairing already requested. Check its status or sign out to start over.');
   const installation=$('installation').value.trim(),conversation=$('conversation').value.trim();
   if(!installation || !conversation)throw new Error('Installation and conversation are required.');
-  if((state.buddies || []).length>=64)throw new Error('This pilot supports up to 64 saved conversations.');
+  if((state.buddies || []).length>=1024)throw new Error('This pilot supports up to 1024 saved conversations.');
   if((state.buddies || []).some(item=>buddyKey(item)===buddyKey({installation,conversation})))throw new Error('This conversation is already saved. Select it from the buddy list.');
   const pairing=await transport.requestPairing(installation,key.publicKey);
   state={...state,installation,conversation,pairing};delete state.displayName;await save();
@@ -481,6 +575,8 @@ function drawHistory(){
     const label=document.createElement('small');label.className='message-meta';
     const stamp=document.createElement('time');stamp.dataset.epoch=item.created;stamp.textContent=globalThis.IAMMessageTime.format(item.created);label.append(stamp);
     const body=document.createElement('div');globalThis.IAMMarkdown.render(body,item.body);article.append(body);
+    const copy=document.createElement('button');copy.textContent='Copy';copy.className='copy-message';
+    copy.onclick=()=>run(async()=>{await native.copyText({text:item.body});message(item.truncated?'Visible excerpt copied. Open the full message to copy all of it.':'Message copied.');},{preserveComposer:true});article.append(copy);
     if(item.truncated){const button=document.createElement('button');button.textContent='Read full message';
       button.onclick=()=>run(()=>openFullText(item),{preserveComposer:true});article.append(button);}
     if(item.sender==='owner'){
@@ -640,7 +736,7 @@ async function start(){
   render();
 }
 run(start);
-document.addEventListener('visibilitychange',()=>{clearTimeout(timer);queuedLive=false;updateLive();if(screen==='chat' && !document.hidden && state?.grantId)run(loadHistory);});
+document.addEventListener('visibilitychange',()=>{if(document.hidden)setPasswordVisible(false);clearTimeout(timer);queuedLive=false;updateLive();if(screen==='chat' && !document.hidden && state?.grantId)run(loadHistory);});
 $('draft').addEventListener('input',()=>{render();if(!state)return;state.draft=$('draft').value;clearTimeout(draftTimer);
   draftTimer=setTimeout(()=>save().catch(()=>message('Draft could not be saved. Keep the app open and copy your text before leaving.')),300);});
 $('latest').onclick=()=>{if(screen!=='chat')return;following=true;$('messages').scrollTop=$('messages').scrollHeight;if(!busy){historyLoaded=false;run(loadHistory);}};
@@ -665,12 +761,13 @@ setInterval(checkVisibleReads,750);
 setInterval(checkUnreadCounts,15000);
 let checkingNotificationTarget=false;
 setInterval(async()=>{
-  if(document.hidden || busy || checkingNotificationTarget || !state?.buddies)return;
+  if(document.hidden || busy || checkingNotificationTarget || !state)return;
   checkingNotificationTarget=true;
   try{
     const target=await native.notificationTarget();
     if(typeof target.id!=='string' || !target.id)return;
-    const buddy=state.buddies.find(b=>b.push?.id===target.id);
+    if(target.id===state.friendPush?.id){await run(()=>openFriends());return;}
+    const buddy=(state.buddies || []).find(b=>b.push?.id===target.id);
     if(buddy && !busy)await run(()=>switchBuddy(buddy));
   }catch{}finally{checkingNotificationTarget=false;}
 },1000);

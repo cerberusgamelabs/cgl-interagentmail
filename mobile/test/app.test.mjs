@@ -6,11 +6,14 @@ import {messageBytes,retryDelay,mergeEvents,confirmedPending,recoveryDue,pending
 import {buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfterLogin} from '../buddies.mjs';
 import {fitDraft} from '../composer.mjs';
 import {imagePreviews} from '../image-grid.mjs';
-import {parseInvitation,enrollConversations} from '../pairing.mjs';
+import {parseInvitation,enrollConversations,mergeDesktopRoster} from '../pairing.mjs';
 import {packState,unpackState} from '../protected-state.mjs';
 import {prepareAttachment,addAttachment,uploadAttachments,manifest} from '../uploads.mjs';
 import {publicProfile,downloadAvatar} from '../profiles.mjs';
 import {installEdgeBack} from '../edge-back.mjs';
+import {activeFriendBuddies} from '../friend-buddies.mjs';
+import {friendNotifications} from '../friend-notifications.mjs';
+import {cachedAvatar,rememberAvatar} from '../avatar-cache.mjs';
 const source=(await readFile(new URL('../app.mjs',import.meta.url),'utf8')).replace(/^import .*;\r?\n/gm,'');
 async function harness({pending=null,sendError=false,failSave=0,lookup={found:true,state:'queued'},lookupError=false,restore=null,uploadError=false,home=false}={}){
   if(pending && pending.createdAt===undefined)pending={...pending,createdAt:Date.now()-8000};
@@ -24,8 +27,8 @@ async function harness({pending=null,sendError=false,failSave=0,lookup={found:tr
   let page={events:[],after:[0,''],more:false};
   class Transport{restoreSession(s){this.session=s;}async requestPairing(){calls.push('pair');return {challenge:'fresh'};}async historyPage(...args){calls.push('read');queries.push(args[4]);return page;}async lookupSend(){calls.push('lookup');if(lookupError)throw Error('unknown');return lookup;}async sendText(...args){calls.push('send');this.lastSent=args;if(sendError)throw Error('offline');return {state:'queued'};}async logout(){this.session=null;}}
   const document={hidden:false,body:{classList:{toggle(){}}},getElementById:get,querySelectorAll:()=>[],createElement:element,createDocumentFragment:()=>({...element(),fragment:true}),documentElement:{scrollHeight:100,style:{setProperty(){}}},addEventListener:(n,f)=>listeners[n]=f};
-  const context=vm.createContext({registerPlugin:()=>native,Capacitor:{isNativePlatform:()=>true},MessengerTransport:Transport,nativeFetch:()=>{},nativeSigner:()=>{},
-    imagePreviews,installEdgeBack,publicProfile,downloadAvatar,packState,unpackState,prepareAttachment,addAttachment,uploadAttachments,manifest,parseInvitation,enrollConversations,fitDraft,messageBytes,retryDelay,mergeEvents,confirmedPending,recoveryDue,pendingLabel,buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfterLogin,document,window:{innerHeight:100,scrollY:0,scrollTo(x,y){this.scrollY=y;},addEventListener(n,f){listeners[n]=f;}},
+  const context=vm.createContext({friendNotifications,cachedAvatar,rememberAvatar,registerPlugin:()=>native,Capacitor:{isNativePlatform:()=>true},MessengerTransport:Transport,nativeFetch:()=>{},nativeSigner:()=>{},
+    activeFriendBuddies,imagePreviews,installEdgeBack,publicProfile,downloadAvatar,packState,unpackState,prepareAttachment,addAttachment,uploadAttachments,manifest,parseInvitation,enrollConversations,mergeDesktopRoster,fitDraft,messageBytes,retryDelay,mergeEvents,confirmedPending,recoveryDue,pendingLabel,buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfterLogin,document,window:{innerHeight:100,scrollY:0,scrollTo(x,y){this.scrollY=y;},addEventListener(n,f){listeners[n]=f;}},
     uploadImage:async image=>{calls.push('upload');if(uploadError)throw Error('upload interrupted');},downloadImage:async()=>{},downloadText:async()=>'<literal full message>',downloadDocument:async()=>({name:'notes.txt',data:'YWJj'}),
     IAMMessageTime:{format:()=> 'Today - 1:00 PM',refresh(){}},IAMReadVisible:{tracker:()=>async()=>{}},setInterval:(fn,ms)=>{intervals.set(ms,fn);return ms;},
     IAMMarkdown:{render(el,text){el.textContent=text;}},TextEncoder,Date,JSON,crypto:{randomUUID:()=> '00000000-0000-4000-8000-000000000000'},confirm:()=>true,
@@ -36,6 +39,134 @@ async function harness({pending=null,sendError=false,failSave=0,lookup={found:tr
   return {get,timers,intervals,listeners,writes,calls,queries,document,context,settle,setPage:p=>page=p,read:()=>vm.runInContext('run(loadHistory)',context)};
 }
 
+test('home refresh renews opted-in notifications with no reads even when live',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext(`
+    state.buddies=[{installation:'node',conversation:'friend',grantId:'grant',grantExpires:9999999999,push:{id:'scope'}}];
+    live={connected:true};
+    native.refreshNotificationToken=async()=>({token:'fresh'});
+    native.registerNotificationScope=async value=>{globalThis.registered=value;};
+    transport.syncEvents=async(...args)=>{globalThis.notificationArgs=args;return {};};
+  `,h.context);
+  await vm.runInContext('checkUnreadCounts()',h.context);
+  assert.equal(vm.runInContext('registered.expires===Math.floor(transport.session.expiresAt/1000)',h.context),true);
+  assert.equal(vm.runInContext('notificationArgs[3].length',h.context),0);
+  assert.equal(vm.runInContext('notificationArgs[5].token',h.context),'fresh');
+  assert.equal(h.get('notificationNotice').hidden,true);
+  assert.ok(!h.calls.includes('read'));assert.ok(!h.calls.includes('send'));
+});
+
+test('notification warning persists across ordinary status updates and clears on successful renewal',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext(`state.buddies=[{installation:'node',conversation:'friend',grantId:'grant',grantExpires:9999999999,push:{id:'scope'}}];
+    native.refreshNotificationToken=async()=>{throw Error('private token error');};`,h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  vm.runInContext("message('Refreshed');render()",h.context);
+  assert.equal(h.get('notificationNotice').hidden,false);
+  assert.match(h.get('notificationNotice').textContent,/could not be refreshed/);
+  assert.ok(!h.get('notificationNotice').textContent.includes('private'));
+  vm.runInContext(`native.refreshNotificationToken=async()=>({token:'fresh'});
+    native.registerNotificationScope=async()=>{};transport.syncEvents=async()=>({});`,h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.equal(h.get('notificationNotice').hidden,true);
+});
+
+test('notification renewal respects opt-in, expired grants, background and session changes',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext(`native.refreshNotificationToken=async()=>{throw Error('must not run');};
+    state.buddies=[{installation:'node',conversation:'off',grantId:'grant',grantExpires:9999999999},
+      {installation:'node',conversation:'expired',grantId:'grant',grantExpires:1,push:{id:'scope'}}];`,h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.match(h.get('notificationNotice').textContent,/expired/);
+  vm.runInContext(`state.buddies[1].grantExpires=9999999999;
+    globalThis.renewalCalls=0;native.refreshNotificationToken=async()=>{renewalCalls++;return {token:'fresh'};};`,h.context);
+  h.document.hidden=true;await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.equal(vm.runInContext('renewalCalls',h.context),0);
+  h.document.hidden=false;
+  vm.runInContext(`native.refreshNotificationToken=async()=>{transport.session=null;return {token:'fresh'};};
+    native.registerNotificationScope=async()=>{renewalCalls++;};`,h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.equal(vm.runInContext('renewalCalls',h.context),0);
+  assert.equal(h.get('notificationNotice').hidden,true);
+});
+
+test('home renewal rotates past failed scopes and keeps their warning until recovered',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext(`state.buddies=['a','b'].map(conversation=>({installation:'node',conversation,grantId:'grant',grantExpires:9999999999,push:{id:conversation}}));
+    native.refreshNotificationToken=async()=>({token:'fresh'});native.registerNotificationScope=async()=>{};
+    globalThis.renewed=[];globalThis.rejectA=true;
+    transport.syncEvents=async(i,c)=>{renewed.push(c);if(c==='a' && rejectA)throw Error('private relay failure');return {};};`,h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.equal(vm.runInContext("renewed.join(',')",h.context),'a,b');
+  assert.equal(h.get('notificationNotice').hidden,false);
+  vm.runInContext('rejectA=false',h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.equal(h.get('notificationNotice').hidden,true);
+});
+
+test('desktop-wide home discovery finds future agents without loading history',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext("state.desktopLinks=[{installation:'node',grantId:'wide',grantExpires:9999999999}];transport.syncEvents=async(i,c,g)=>{if(c!=='@desktop')throw Error('Unexpected history');return {desktopRoster:[{conversation:'future',displayName:'Future agent'}]};}",h.context);
+  await vm.runInContext('refreshDesktopLinks()',h.context);
+  assert.equal(vm.runInContext("state.buddies.find(b=>b.conversation==='future').grantId",h.context),'wide');
+  assert.ok(!h.calls.includes('read'));assert.ok(!h.calls.includes('send'));
+  h.document.hidden=true;
+  vm.runInContext("transport.syncEvents=async()=>{throw Error('Must not query while hidden')}",h.context);
+  await vm.runInContext('refreshDesktopLinks()',h.context);
+});
+
+test('sign-in password toggle preserves value and hides again on submit',async()=>{
+  const h=await harness({home:true});
+  h.get('password').type='password';h.get('password').value='example-only';
+  h.get('togglePassword').onclick();
+  assert.equal(h.get('password').type,'text');
+  assert.equal(h.get('togglePassword').ariaLabel,'Hide password');
+  assert.equal(h.get('password').value,'example-only');
+  h.get('togglePassword').onclick();
+  assert.equal(h.get('password').type,'password');
+  assert.equal(h.get('togglePassword').textContent,'Show');
+  h.get('togglePassword').onclick();
+  h.document.hidden=true;h.listeners.visibilitychange();
+  assert.equal(h.get('password').type,'password');
+  assert.equal(h.get('password').value,'example-only');
+  h.document.hidden=false;h.get('togglePassword').onclick();
+  h.get('loginForm').onsubmit({preventDefault(){}});await h.settle();
+  assert.equal(h.get('password').type,'password');
+  assert.equal(h.get('password').value,'');
+});
+
+test('one unavailable desktop does not suppress discovery on another approved link',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext("state.desktopLinks=[{installation:'offline',grantId:'a',grantExpires:9999999999},{installation:'node',grantId:'wide',grantExpires:9999999999}];transport.syncEvents=async(i)=>{if(i==='offline')throw Error('offline');return {desktopRoster:[{conversation:'new',displayName:'New Spark'}]};}",h.context);
+  await vm.runInContext('refreshDesktopLinks()',h.context);
+  assert.equal(vm.runInContext("state.buddies.find(b=>b.conversation==='new').grantId",h.context),'wide');
+  assert.ok(!h.calls.includes('read'));
+});
+
+test('friend-only home renders both directions, filters and clears on session change',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext("state.buddies=[];transport.friends=async()=>({self:{enabled:true},relationships:[{id:'a',state:'active',incoming:true,peer:{name:'Iris'},unread:2},{id:'b',state:'active',incoming:false,peer:{name:'Wren'},unread:0}]})",h.context);
+  await vm.runInContext('refreshFriendSummary()',h.context);
+  assert.equal(h.get('buddies').children.length,2);
+  assert.equal(h.get('buddies').children[0].children[1].children[0].textContent,'Iris');
+  assert.equal(h.get('buddies').children[0].children[2].textContent,'2 unread');
+  assert.equal(vm.runInContext('state.buddies.length',h.context),0);
+  h.get('buddySearch').value='wren';vm.runInContext('drawBuddies()',h.context);
+  assert.equal(h.get('buddies').children.length,1);
+  vm.runInContext('transport.session={};drawBuddies()',h.context);
+  assert.equal(h.get('buddies').children.length,0);
+  assert.match(h.get('emptyBuddies').textContent,/Friends and invitations/);
+});
+test('friend roster refresh removes revoked rows and does not fetch message history',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext("state.buddies=[];transport.friends=async()=>({self:{enabled:true},relationships:[{id:'a',state:'active',peer:{name:'Iris'}}]})",h.context);
+  await vm.runInContext('refreshFriendSummary()',h.context);
+  assert.equal(h.get('buddies').children.length,1);
+  vm.runInContext("transport.friends=async()=>({self:{enabled:true},relationships:[]})",h.context);
+  await vm.runInContext('refreshFriendSummary()',h.context);
+  assert.equal(h.get('buddies').children.length,0);assert.ok(!h.calls.includes('read'));
+});
 test('message time and delivery marker follow the body in a footer',async()=>{
   const h=await harness();
   vm.runInContext("events=[{id:'out',sender:'owner',body:'Hello',created:123,delivery:'replied'},{id:'in',sender:'resident',body:'Hi',created:124}];drawHistory()",h.context);

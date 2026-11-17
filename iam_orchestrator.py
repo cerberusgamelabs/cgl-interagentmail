@@ -158,6 +158,31 @@ def configured_endpoint() -> str:
         return DEFAULT_URL
     if os.name != "nt" or type(port) is not int or not 1024 <= port <= 65535:
         raise IAMError("Invalid Windows hidden-console configuration (port must be 1024..65535).")
+    # The configured port is a launch preference, not the identity of a live
+    # server. Follow only the ownership record published by IAM's launcher.
+    marker = iam.ROOT / "run" / "app-server-console-mode.json"
+    try:
+        saved = iam.load(marker)
+    except FileNotFoundError:
+        saved = {}
+    except (OSError, ValueError) as exc:
+        raise IAMError("Cannot read IAM app-server ownership record safely.") from exc
+    if not isinstance(saved, dict):
+        raise IAMError("Invalid IAM app-server ownership record.")
+    pid = saved.get("pid")
+    if type(pid) is int and pid > 0 and pid == read_pid("app-server") and pid_alive(pid):
+        url = saved.get("url")
+        # Do not discover arbitrary listeners, accept remote hosts, or silently
+        # switch from compatibility mode to the native daemon.
+        if not isinstance(url, str) or not re.fullmatch(r"ws://(?:127\.0\.0\.1|localhost):[0-9]+", url):
+            raise IAMError("Invalid IAM-owned app-server endpoint.")
+        try:
+            live_port = urlsplit(url).port
+        except ValueError:
+            raise IAMError("Invalid IAM-owned app-server port.") from None
+        if live_port is None or not 1024 <= live_port <= 65535:
+            raise IAMError("Invalid IAM-owned app-server port.")
+        return url
     return f"ws://127.0.0.1:{port}"
 
 
@@ -626,6 +651,8 @@ def is_managed_endpoint(url: str) -> bool:
 def appserver_client(
     url: str, *, request_timeout: float = 30.0, experimental_api: bool = True
 ) -> AppServerClient:
+    if url == "configured://":
+        url = configured_endpoint()
     options = {
         "request_timeout": request_timeout,
         "experimental_api": experimental_api,
@@ -825,10 +852,23 @@ def _ensure_appserver(url: str, wait_seconds: float = 15.0) -> str:
             return f"started (pid {pid})"
         if not pid_alive(pid):
             break
+    if hidden_console and pid_alive(pid):
+        # A readiness timeout is not a failed process launch. Retain this
+        # launch's identity so a later healthy probe can reuse it, and stop
+        # can still target it. Never adopt an arbitrary port owner.
+        marker = iam.ROOT / "run" / "app-server-console-mode.json"
+        if marker.exists():
+            iam.write_atomic(marker.with_name("app-server-previous-ownership.json"), iam.load(marker))
+        iam.write_atomic(marker, {"pid": pid, "url": url})
+        pid_path("app-server").write_text(str(pid) + "\n", encoding="utf-8")
+        raise SystemExit(
+            f"Codex app-server launcher {pid} is still running, but readiness was not confirmed at {url}. "
+            f"Ownership was retained. See {log_path('app-server')}; retry `iam start` after it becomes ready. "
+            "No supervisor was started."
+        )
     raise SystemExit(
-        f"Codex app-server did not start. See {log_path('app-server')}. "
-        "If the endpoint port is still occupied after Codex was force-closed, "
-        "restart Windows to clear the stale listener, then run `iam start` again."
+        f"Codex app-server readiness was not confirmed. See {log_path('app-server')}. "
+        "Inspect the log and port owner before retrying; previous ownership records were preserved."
     )
 
 
@@ -840,8 +880,11 @@ def ensure_daemon(url: str) -> str:
         pid_path("supervisor").unlink()
     except FileNotFoundError:
         pass
+    # Resolve the configured endpoint for each new connection, including the
+    # heartbeat and friend lanes. Explicit alternate endpoints remain pinned.
+    supervisor_url = "configured://" if url == configured_endpoint() else url
     command = [
-        sys.executable, "-m", "iam_orchestrator", "serve", "--url", url,
+        sys.executable, "-m", "iam_orchestrator", "serve", "--url", supervisor_url,
         "--log-file", str(log_path("supervisor")),
     ]
     spawn_background(command, "supervisor", record_pid=False, capture_output=False)
@@ -1535,7 +1578,8 @@ def cmd_web_stop(args: argparse.Namespace) -> int:
             stale_path.unlink()
         except FileNotFoundError:
             pass
-    print("The IAM supervisor and Codex app-server were left running.")
+    if not getattr(args, "coordinated_stop", False):
+        print("The IAM supervisor and Codex app-server were left running.")
     return 0
 
 
@@ -1701,6 +1745,10 @@ def cmd_connect_status(args: argparse.Namespace) -> int:
 
 
 def cmd_connect_stop(args: argparse.Namespace) -> int:
+    return stop_webconnect(disable=True)
+
+
+def stop_webconnect(*, disable: bool) -> int:
     pid = read_pid("connect")
     if pid_alive(pid):
         assert pid is not None
@@ -1708,12 +1756,13 @@ def cmd_connect_stop(args: argparse.Namespace) -> int:
         print(f"Stopped WebConnect client process tree {pid}.")
     else:
         print("WebConnect client is not running.")
-    try:
-        config = load_webconnect_config()
-        config["enabled"] = False
-        save_webconnect_config(config)
-    except WebConnectError:
-        pass
+    if disable:
+        try:
+            config = load_webconnect_config()
+            config["enabled"] = False
+            save_webconnect_config(config)
+        except WebConnectError:
+            pass
     try:
         pid_path("connect", create=False).unlink()
     except FileNotFoundError:
@@ -2790,6 +2839,10 @@ def cmd_stop(args: argparse.Namespace) -> None:
     else:
         print("IAM supervisor is not running.")
     if args.all:
+        # The supervisor is stopped first so it cannot recreate companions.
+        # Preserve connector preferences during a coordinated shutdown.
+        stop_webconnect(disable=False)
+        cmd_web_stop(argparse.Namespace(coordinated_stop=True))
         endpoint = configured_endpoint()
         compatibility = load_config().get("windows_hidden_console_port") is not None
         server_pid = read_pid("app-server")
@@ -3072,7 +3125,7 @@ def main(argv: list[str] | None = None) -> int:
         # Resolve at invocation time, not import time; direct --url always wins.
         supplied = sys.argv[1:] if argv is None else argv
         if hasattr(args, "url") and not any(item == "--url" or item.startswith("--url=") for item in supplied):
-            args.url = configured_endpoint()
+            args.url = "configured://" if args.func == cmd_daemon else configured_endpoint()
         result = args.func(args)
     except IAMError as exc:
         if not getattr(args, "json_output", False):

@@ -16,10 +16,14 @@ export async function validateOwnerProof(proof,intent,{now=Date.now(),cryptoImpl
      value.protocol!=='iam-owner-proof' || value.version!==1 || typeof proof.nonce!=='string' ||
      !/^[A-Za-z0-9_-]{32,128}$/.test(proof.nonce) || value.nonce!==proof.nonce ||
      !Number.isSafeInteger(value.expires_at) || value.expires_at!==proof.expires_at ||
-     value.expires_at*1000<=now || value.expires_at*1000>now+60000)
-    throw new Error('Device proof does not match intent');
+     !Number.isFinite(now))
+    throw new Error('Device proof does not match intent (proof_format)');
+  if(value.expires_at*1000<=now)
+    throw new Error('Device proof does not match intent (proof_expired; check device time)');
+  if(value.expires_at*1000>now+60000)
+    throw new Error('Device proof does not match intent (proof_time_window; check device time)');
   for(const key of ['grant_id','home_server','account_id','device_id','installation_id','conversation_id','operation'])
-    if(typeof intent[key]!=='string' || !intent[key] || value[key]!==intent[key])throw new Error('Device proof does not match intent');
+    if(typeof intent[key]!=='string' || !intent[key] || value[key]!==intent[key])throw new Error('Device proof does not match intent ('+key+')');
   if(!['history','send','attachment','events'].includes(intent.operation))throw new Error('Unsupported signed operation');
   const digest=await cryptoImpl.subtle.digest('SHA-256',decodeBase64(intent.content,['attachment','events'].includes(intent.operation)?65536:4096));
   const hex=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');

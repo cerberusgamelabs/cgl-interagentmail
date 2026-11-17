@@ -408,7 +408,7 @@ class WebConnectClient:
             return []
         if not isinstance(projects, dict):
             return []
-        return sorted(address for address in projects if isinstance(address, str) and re.fullmatch(r"[A-Za-z0-9._-]+", address))
+        return sorted(address for address in projects if isinstance(address, str) and re.fullmatch(r"[A-Za-z0-9 ._-]{1,200}", address) and address.strip() and address not in (".", ".."))
 
     def mailbox_directory(self) -> dict[str, Any]:
         addresses = self.project_mailboxes()

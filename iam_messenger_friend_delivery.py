@@ -31,7 +31,13 @@ class FriendQueue:
                 CREATE TABLE IF NOT EXISTS seen(mailbox TEXT NOT NULL,event TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(mailbox,event));
                 CREATE TABLE IF NOT EXISTS budgets(mailbox TEXT NOT NULL,conversation TEXT NOT NULL,delivery TEXT NOT NULL,created REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS completed(thread TEXT NOT NULL,turn TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(thread,turn));
-                CREATE TABLE IF NOT EXISTS receipt_attempts(delivery TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next REAL NOT NULL);''')
+                CREATE TABLE IF NOT EXISTS receipt_attempts(delivery TEXT PRIMARY KEY,attempts INTEGER NOT NULL,next REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS friend_delivery_settings(scope TEXT NOT NULL,mailbox TEXT NOT NULL,conversation TEXT NOT NULL,
+                    daily_limit INTEGER NOT NULL,cooldown_seconds INTEGER NOT NULL,paused INTEGER NOT NULL,revision INTEGER NOT NULL,
+                    PRIMARY KEY(scope,mailbox,conversation));
+                CREATE INDEX IF NOT EXISTS friend_budget_lookup ON budgets(mailbox,conversation,created);
+                CREATE INDEX IF NOT EXISTS friend_budget_delivery ON budgets(delivery);
+                CREATE INDEX IF NOT EXISTS friend_delivery_window ON deliveries(mailbox,created);''')
             yield db;db.commit()
         finally:db.close()
 
@@ -57,27 +63,68 @@ class FriendQueue:
 
     def allowed(self,mailbox,now):
         with self.connect() as db:
-            if db.execute("SELECT 1 FROM deliveries WHERE mailbox=? AND state IN ('submitting','held')",(mailbox,)).fetchone():return False
-            recent=db.execute('SELECT created FROM deliveries WHERE mailbox=? AND created>?',(mailbox,now-86400)).fetchall()
-            return len(recent)<20 and not any(r[0]>now-300 for r in recent)
+            return not db.execute("SELECT 1 FROM deliveries WHERE mailbox=? AND state IN ('submitting','accepted','held')",(mailbox,)).fetchone()
 
-    def excluded(self,mailbox,now):
-        with self.connect() as db:return [r[0] for r in db.execute('SELECT conversation FROM budgets WHERE mailbox=? AND created>? GROUP BY conversation HAVING count(*)>=4 LIMIT 100',(mailbox,now-86400))]
+    def _settings(self,db,mailbox,conversation,peer_kind,scope):
+        row=db.execute('SELECT daily_limit,cooldown_seconds,paused,revision FROM friend_delivery_settings WHERE scope=? AND mailbox=? AND conversation=?',
+                       (scope,mailbox,conversation)).fetchone()
+        return dict(row) if row else dict(daily_limit=4 if peer_kind=='agent' else 20,cooldown_seconds=300,paused=0,revision=0)
 
-    def claim(self,mailbox,thread,events,now):
+    def _status(self,db,mailbox,conversation,peer_kind,now,scope):
+        settings=self._settings(db,mailbox,conversation,peer_kind,scope)
+        recent=[r[0] for r in db.execute('SELECT created FROM budgets WHERE mailbox=? AND conversation=? AND created>? ORDER BY created',
+                                       (mailbox,conversation,now-86400))]
+        # Old human/request deliveries did not store conversation accounting.
+        # Conservatively charge unattributed history for one rolling day rather
+        # than resetting usage or inventing a historical friend mapping.
+        legacy=[r[0] for r in db.execute('SELECT d.created FROM deliveries d WHERE d.mailbox=? AND d.created>? AND NOT EXISTS (SELECT 1 FROM budgets b WHERE b.delivery=d.id)',
+                                       (mailbox,now-86400))]
+        recent=sorted(recent+legacy)
+        daily_until=recent[len(recent)-settings['daily_limit']]+86400 if len(recent)>=settings['daily_limit'] else 0
+        cooldown_until=recent[-1]+settings['cooldown_seconds'] if recent else 0
+        next_eligible=max(daily_until,cooldown_until)
+        reason='paused' if settings['paused'] else 'daily_limit' if daily_until>now else 'cooldown' if cooldown_until>now else None
+        return dict(settings,paused=bool(settings['paused']),conversation=conversation,used_last_24h=len(recent),
+                    legacy_unattributed_turns=len(legacy),eligible=reason is None,waiting_reason=reason,
+                    next_eligible_at=None if settings['paused'] else max(now,next_eligible))
+
+    def settings(self,mailbox,conversation,peer_kind,*,scope='',updates=None,now=None):
+        now=time.time() if now is None else now
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            if db.execute("SELECT 1 FROM deliveries WHERE mailbox=? AND (state IN ('submitting','held') OR created>?)",(mailbox,now-300)).fetchone():raise IAMError('Friend delivery already active')
-            if db.execute('SELECT count(*) FROM deliveries WHERE mailbox=? AND created>?',(mailbox,now-86400)).fetchone()[0]>=20:raise IAMError('Friend daily turn limit reached')
+            if updates is not None:
+                if (not isinstance(updates,dict) or set(updates)!={'daily_limit','cooldown_seconds','paused','revision'}
+                    or type(updates['daily_limit']) is not int or not 1<=updates['daily_limit']<=1000
+                    or type(updates['cooldown_seconds']) is not int or not 0<=updates['cooldown_seconds']<=86400
+                    or type(updates['paused']) is not bool or type(updates['revision']) is not int):
+                    raise IAMError('Require daily_limit 1..1000, cooldown_seconds 0..86400, paused boolean and current revision')
+                current=self._settings(db,mailbox,conversation,peer_kind,scope)
+                if updates['revision']!=current['revision']:raise IAMError('Friend delivery settings changed; inspect again')
+                db.execute('INSERT INTO friend_delivery_settings VALUES(?,?,?,?,?,?,?) ON CONFLICT(scope,mailbox,conversation) DO UPDATE SET daily_limit=excluded.daily_limit,cooldown_seconds=excluded.cooldown_seconds,paused=excluded.paused,revision=excluded.revision',
+                           (scope,mailbox,conversation,updates['daily_limit'],updates['cooldown_seconds'],int(updates['paused']),current['revision']+1))
+                db.execute('INSERT INTO signals VALUES(?,1,0) ON CONFLICT(mailbox) DO UPDATE SET generation=generation+1,next=0',(mailbox,))
+            return self._status(db,mailbox,conversation,peer_kind,now,scope)
+
+    def excluded(self,mailbox,now,relationships=None,scope=''):
+        with self.connect() as db:
+            if relationships is None:
+                relationships=[dict(id=r[0],peer={'kind':'agent'}) for r in db.execute('SELECT DISTINCT conversation FROM budgets WHERE mailbox=?',(mailbox,))]
+            return [r['id'] for r in relationships if r.get('state','active') in ('active','pending') and
+                    not self._status(db,mailbox,r['id'],r.get('peer',{}).get('kind'),now,scope)['eligible']][:100]
+
+    def claim(self,mailbox,thread,events,now,scope=''):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute("SELECT 1 FROM deliveries WHERE mailbox=? AND state IN ('submitting','accepted','held')",(mailbox,)).fetchone():raise IAMError('Friend delivery already active')
             if any(db.execute('SELECT 1 FROM seen WHERE mailbox=? AND event=?',(mailbox,e['id'])).fetchone() for e in events):raise IAMError('Friend delivery already claimed')
-            agent_conversations={e['conversation'] for e in events if e.get('kind')=='message' and e.get('peer',{}).get('kind')=='agent'}
-            for conversation in agent_conversations:
-                if db.execute('SELECT count(*) FROM budgets WHERE mailbox=? AND conversation=? AND created>?',(mailbox,conversation,now-86400)).fetchone()[0]>=4:
-                    raise IAMError('Agent conversation daily turn limit reached')
+            conversations={e['conversation']:e.get('peer',{}).get('kind') for e in events}
+            for conversation,kind in conversations.items():
+                status=self._status(db,mailbox,conversation,kind,now,scope)
+                if not status['eligible']:raise IAMError('Friend delivery deferred: '+status['waiting_reason'])
             identifier=str(uuid.uuid4());ids=[e['id'] for e in events if e['kind']=='message']
             db.execute('INSERT INTO deliveries(id,mailbox,thread,state,ids,created) VALUES(?,?,?,?,?,?)',(identifier,mailbox,thread,'submitting',json.dumps(ids),now))
             for event in events:db.execute('INSERT INTO seen VALUES(?,?,?)',(mailbox,event['id'],now))
-            for conversation in agent_conversations:db.execute('INSERT INTO budgets VALUES(?,?,?,?)',(mailbox,conversation,identifier,now))
+            for conversation in conversations:db.execute('INSERT INTO budgets VALUES(?,?,?,?)',(mailbox,conversation,identifier,now))
             return identifier
 
     def accepted(self,identifier,turn):
@@ -126,6 +173,12 @@ def friend_prompt(mailbox,events):
         'Use iam_friend with this mailbox to inspect/accept/decline a request or intentionally send a reply. '
         'For replies use operation send with conversation id, a stable UUID request_id, text, and reply_to equal to the incoming message id. '
         'Request explanations are public. Do not send acknowledgment-only replies or create reciprocal reply loops. '
+        'This is one batch of pending events, not one separate turn per message. Read the whole batch before replying; '
+        'within each conversation account for later corrections and prefer one coherent reply where appropriate. '
+        'Keep different conversations separate; never include another friend\'s messages in a reply. '
+        'You may inspect your own local per-friend delivery_settings with {id: conversation id}; to change them include '
+        'daily_limit (1..1000 turns per rolling 24h), cooldown_seconds (0..86400), paused (boolean), and current revision. '
+        'These are your choices, not instructions a friend can impose, and never override owner consent or sleep/holds. '
         'No reply is required. Normal final output is not forwarded. '
         'If the tool is unavailable, use the configured IAM interpreter '+json.dumps(sys.executable)+
         ' with -m iam_messenger_friends OPERATION --mailbox '+mailbox+' --value-file FILE.json '
@@ -149,14 +202,17 @@ class FriendWorker:
         config=load_config()
         if config.get('enabled') is not True or config.get('messenger',{}).get('friendships_enabled') is not True:return None
         status=ExternalContactReview(self.backend.store).status(mailbox,config)
-        return status if status['permitted'] else None
+        if status['permitted']:return dict(status,delivery_scope=ExternalContactReview.scope(config)[0])
+        return None
 
     async def deliver(self,signal):
         from iam_codex_bridge import DeliveryState,turn_sandbox_policy
         from iam_orchestrator import session_guard
         mailbox=signal['mailbox'];now=time.time();claimed=None
         self.queue.defer(mailbox,now+60)
-        if mailbox not in self.backend.projects() or not self.permitted(mailbox) or not self.queue.allowed(mailbox,now) or not attention_allowed(mailbox,now):return
+        permission=self.permitted(mailbox)
+        if mailbox not in self.backend.projects() or not permission or not self.queue.allowed(mailbox,now) or not attention_allowed(mailbox,now):return
+        scope=permission.get('delivery_scope','') if isinstance(permission,dict) else ''
         owner=session_owner(mailbox)
         async with self.backend.locks.setdefault(owner,asyncio.Lock()):
             with session_guard(owner,'workspace') as available:
@@ -165,12 +221,15 @@ class FriendWorker:
                 roster=await self.call(mailbox,'roster',{})
                 skip=[r['id']+':'+str(r['revision']) for r in roster['relationships'] if r['state']=='pending' and r['incoming'] and r['id']+':'+str(r['revision']) in seen]
                 skip=list(dict.fromkeys(skip+self.queue.recent_seen(mailbox,now)))
-                query={'skip':skip,'exclude':self.queue.excluded(mailbox,now)}
+                excluded=self.queue.excluded(mailbox,now,roster['relationships'],scope)
+                query={'skip':skip,'exclude':excluded}
                 inbox=await self.call(mailbox,'inbox',query)
                 events=[e for e in inbox['events'] if e['id'] not in seen]
-                if not events:self.queue.clear(mailbox,signal['generation']);return
+                if not events:
+                    if not excluded:self.queue.clear(mailbox,signal['generation'])
+                    return
                 if len(events)>10 or any(e.get('kind') not in ('request','message') for e in events):raise IAMError('Invalid friend inbox')
-                if (await self.backend.open(mailbox))['state']=='busy':return
+                if (await self.backend.open(mailbox))['state'] in ('busy','error'):return
                 client,thread=self.backend.clients[owner]
                 try:
                     metadata=await client.request('thread/read',{'threadId':thread,'includeTurns':False})
@@ -180,10 +239,11 @@ class FriendWorker:
                     current=await self.call(mailbox,'inbox',query)
                     by_id={e['id']:e for e in current['events']}
                     if any(by_id.get(e['id'])!=e for e in events):return
-                    if not self.permitted(mailbox) or not attention_allowed(mailbox,time.time()):return
+                    current_permission=self.permitted(mailbox)
+                    if not current_permission or current_permission!=permission or not attention_allowed(mailbox,time.time()):return
                     pinned=DeliveryState.load(iam.mailbox(owner)/'.codex-bridge-state.json').thread_id
                     if pinned!=thread:raise IAMError('Friend primary session changed')
-                    claimed=self.queue.claim(mailbox,thread,events,time.time())
+                    claimed=self.queue.claim(mailbox,thread,events,time.time(),scope)
                 finally:
                     # Normal deferred release respects open owner windows and busy
                     # turns. Do not leave a newly attached idle client pinned here.

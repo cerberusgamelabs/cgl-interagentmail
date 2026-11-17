@@ -29,3 +29,10 @@ test('altered relay proof never reaches signer or history read',async()=>{
   await assert.rejects(transport.historyPage('node','pilot',intent.grant_id,async()=>{signs++;}));
   assert.equal(calls,1);assert.equal(signs,0);
 });
+test('proof diagnostics identify checks without including identity values',async()=>{
+  await assert.rejects(validateOwnerProof(proof({device_id:'private-device-value'}),intent,{now}),
+    e=>e.message.endsWith('(device_id)') && !e.message.includes('private-device-value'));
+  await assert.rejects(validateOwnerProof(proof({expires_at:Math.floor(now/1000)-1}),intent,{now}),/proof_expired/);
+  await assert.rejects(validateOwnerProof(proof({expires_at:Math.floor(now/1000)+100}),intent,{now}),/proof_time_window/);
+  await assert.rejects(validateOwnerProof(proof({version:2}),intent,{now}),/proof_format/);
+});

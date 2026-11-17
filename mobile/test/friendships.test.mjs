@@ -19,6 +19,29 @@ function fixture(native){
   const click=async label=>{const b=dialog.querySelectorAll('button').find(b=>b.textContent===label);assert.ok(b,label);await b.onclick();await new Promise(r=>setImmediate(r));};
   return {ui,dialog,state,calls,click,document,transport,get scope(){return scope;},set failSave(x){failSave=x;},set block(x){block=x;}};
 }
+test('buddy entry opens existing friend chat directly without owner pairing',async()=>{
+  const f=fixture();await f.ui.open('relation');
+  assert.equal(f.calls.filter(([op])=>op==='roster').length,1);
+  assert.ok(!f.dialog.querySelectorAll('button').some(b=>b.textContent==='Create one-use invitation'));
+  assert.ok(f.calls.some(([op])=>op==='history'));
+  assert.equal(f.state.grantId,undefined);
+  assert.equal(f.state.buddies,undefined);
+});
+test('stale buddy entry rechecks relationship and never opens revoked history',async()=>{
+  const f=fixture();f.block=true;await f.ui.open('relation');
+  assert.ok(!f.calls.some(([op])=>op==='history'));
+});
+test('copying friend text is explicit and does not send or change a relationship',async()=>{
+  const copied=[];const f=fixture({copyText:async value=>copied.push(value.text)});
+  await f.ui.open('relation');assert.equal(copied.length,0);
+  await f.click('Copy');assert.deepEqual(copied,['<script>not HTML</script>']);
+  assert.ok(!f.calls.some(([op])=>['send','decide'].includes(op)));
+});
+test('friend management exposes separate request, pending and profile tabs',async()=>{
+  const f=fixture();await f.ui.open();
+  for(const label of ['✉ Requests','◷ Pending','⚙ Profile','☰ All'])await f.click(label);
+  assert.ok(!f.calls.some(([op])=>['send','decide','self'].includes(op)));
+});
 test('friend images form a grid while document saves stay separate',async()=>{
   const f=fixture({validateImage:async()=>{},saveAttachment:async()=>{}}),original=f.transport.friends;
   f.transport.friends=async(op,value)=>op==='history'?{events:[{id:'pictures',text:'',own:false,created:1,files:[
@@ -93,6 +116,6 @@ test('friend chat uses bubbles and footer receipts with help outside the compose
   await f.click('Help');assert.equal(help.hidden,true);
   assert.equal(f.dialog.querySelectorAll('textarea')[0],compose);assert.equal(compose.value,'draft');
   assert.ok(!f.calls.some(([op])=>['send','decide','self'].includes(op)));
-  await f.click('Friends');assert.equal(f.dialog.className,'');
+  await f.click('Back');assert.equal(f.dialog.open,false);
   assert.equal(f.state.friendDrafts.relation.text,'draft');
 });

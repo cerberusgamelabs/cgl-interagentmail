@@ -27,6 +27,20 @@ federation and remote sensitive-tool approvals are not implemented.
 
 ## Trust and privacy
 
+The 0.9.9f pilot keeps the seven-day login lifetime. A fresh password login may
+retain the same device identity when the app still holds its previous device
+credential on the same server and local key. The relay retains only its hash
+for up to 30 days after expiry; expired credentials do not authorize requests.
+Recovery consumes that credential and issues a new one. Revocation, password
+changes, account changes, and independent desktop-grant expiry still apply.
+If an earlier app login already discarded links, approve a fresh desktop link
+once; the app does not reconstruct or silently widen old grants.
+
+Avatar thumbnails are bounded to 48 entries / 4 MiB of encoded data inside
+encrypted account state, keyed by conversation, grant, and avatar digest.
+Message copying is explicit and puts the selected text on Android's clipboard;
+clipboard contents are outside IAM's encrypted storage.
+
 Login alone is not owner authority. Owner access requires local desktop review
 of a public-key-bound pairing grant and fingerprint. Android Keystore protects
 P-256 keys; saved login state uses AES-GCM in the no-backup directory.

@@ -3,11 +3,11 @@ export function edgeBack({startX,startY,endX,endY,width,elapsed}){
   if(elapsed<0 || elapsed>900 || Math.abs(endY-startY)>30)return false;
   return startX<=18 && endX-startX>=64 || startX>=width-18 && startX-endX>=64;
 }
-export function installEdgeBack(target,{enabled,back,width=()=>globalThis.innerWidth,now=()=>Date.now()}){
+export function installEdgeBack(target,{enabled,back,width=()=>globalThis.innerWidth,now=()=>Date.now(),allowDialog=false}){
   let start=null;
   target.addEventListener('pointerdown',event=>{
     start=null;
-    if(!enabled() || event.isPrimary===false || event.pointerType!=='touch' || event.target?.closest?.('input,textarea,[contenteditable="true"],dialog'))return;
+    if(!enabled() || event.isPrimary===false || event.pointerType!=='touch' || event.target?.closest?.(allowDialog?'input,textarea,[contenteditable="true"]':'input,textarea,[contenteditable="true"],dialog'))return;
     if(event.clientX>18 && event.clientX<width()-18)return;
     start={id:event.pointerId,startX:event.clientX,startY:event.clientY,width:width(),time:now()};
   },{passive:true});

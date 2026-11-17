@@ -5,8 +5,9 @@ import {buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfte
 test('same account recovery keeps contacts and drafts but never reuses another device grant',()=>{
   const session={accountId:'owner',homeServer:'relay',deviceId:'old'};
   const buddy={installation:'node',conversation:'friend',grantId:'grant',grantExpires:123,pairing:{},push:{},draft:'keep',pending:{id:'original'}};
-  const saved={...buddy,origin:'https://relay.test',keyFingerprint:'key',session,buddies:[buddy],accountPairing:{}};
+  const saved={...buddy,origin:'https://relay.test',keyFingerprint:'key',session,buddies:[buddy],accountPairing:{},desktopLinks:[{installation:'node',grantId:'wide'}]};
   const restored=restoreAfterLogin(saved,saved.origin,{...session,deviceId:'new'},'key');
+  assert.equal(restored.desktopLinks,undefined);
   for(const value of [restored,...restored.buddies]){
     assert.equal(value.draft,'keep');assert.equal(value.pending.id,'original');
     for(const field of ['grantId','grantExpires','pairing','push'])assert.equal(value[field],undefined);
@@ -44,7 +45,7 @@ test('selecting a conversation replaces rather than merges permissions and pendi
   assert.equal(next.origin,'https://example.test');assert.equal(next.grantId,undefined);assert.equal(next.pending,undefined);assert.equal(next.draft,undefined);assert.equal(next.pairing,undefined);
 });
 test('bounded roster rejects additions but permits updates at capacity',()=>{
-  const list=Array.from({length:64},(_,i)=>({installation:'node',conversation:String(i)}));
-  assert.throws(()=>rememberBuddy(list,{installation:'node',conversation:'extra'}),/64/);
-  assert.equal(rememberBuddy(list,{installation:'node',conversation:'0',draft:'new'}).length,64);
+  const list=Array.from({length:1024},(_,i)=>({installation:'node',conversation:String(i)}));
+  assert.throws(()=>rememberBuddy(list,{installation:'node',conversation:'extra'}),/1024/);
+  assert.equal(rememberBuddy(list,{installation:'node',conversation:'0',draft:'new'}).length,1024);
 });

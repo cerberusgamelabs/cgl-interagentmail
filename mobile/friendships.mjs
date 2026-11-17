@@ -3,11 +3,13 @@ import {prepareAttachment,addAttachment,uploadAttachments,manifest} from './uplo
 import {downloadDocument,validDocumentName} from './documents.mjs';
 import {fitDraft} from './composer.mjs';
 import {imagePreviews} from './image-grid.mjs';
+import {installEdgeBack} from './edge-back.mjs';
 // Separate from owner pairing: every call uses the account's friend API only.
-export function createFriendships({dialog,getTransport,getState,save,document,native,onScope=()=>{},uuid=()=>crypto.randomUUID()}) {
+export function createFriendships({dialog,getTransport,getState,save,document,native,enableNotifications,onScope=()=>{},uuid=()=>crypto.randomUUID()}) {
   let generation=0,busy=false,current=null,queued=false,rosterRows=null,selfEnabled=false,messages=null,messageRows=[],older=null,typingLabel=null,typingTimer=null,helpOpen=false;
   const content=document.createElement('section'),notice=document.createElement('p');notice.setAttribute('role','status');
   const previews=imagePreviews({document});let imageView=null;
+  let selectedTab='all';
   function closeImage(){imageView?.remove();imageView=null;}
   document.addEventListener?.('visibilitychange',()=>{if(document.hidden){closeImage();previews.clear();}});
   const close=document.createElement('button');close.textContent='Close friends';
@@ -25,7 +27,8 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
     if(g!==generation || t!==getTransport() || !t.session || !dialog.open || document.hidden)throw Error('View changed');
     return result;
   }
-  async function home(){
+  async function home(tab=selectedTab){
+    selectedTab=tab;
     closeImage();previews.clear();
     visible.reset();
     helpOpen=false;dialog.className='';close.hidden=false;clearTimeout(typingTimer);
@@ -38,6 +41,9 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
       button('Enable my friend profile',async()=>{await request('self',{name:name.value,enabled:true,discoverable:false});await home();});return;
     }
     text('Your friend name: '+roster.self.name);
+    if(enableNotifications)button('Enable / refresh friend notifications',async()=>{
+      await enableNotifications();notice.textContent='Friend notification registration accepted. Alerts contain no names or message text.';
+    });
     button('Create one-use invitation',async()=>{const value=await request('invite');
       if(!/^[A-Za-z0-9_-]{43}$/.test(value.code))throw Error('Invalid invite');
       const code=input('Share this friend invitation, not your owner linking code');code.maxLength=43;code.value=value.code;code.readOnly=true;
@@ -56,6 +62,12 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
       button('Confirm disable and revoke friendships',async()=>{await request('self',{name:roster.self.name,enabled:false,discoverable:false});await home();},review);
       button('Keep my profile enabled',async()=>review.remove(),review);
     });
+    const profileControls=[...content.children];
+    for(const el of profileControls)el.hidden=!['all','profile'].includes(selectedTab);
+    const tabs=document.createElement('nav');tabs.className='friend-tabs';tabs.setAttribute('aria-label','Friend settings');content.append(tabs);
+    for(const [id,label] of [['all','☰ All'],['requests','✉ Requests'],['pending','◷ Pending'],['profile','⚙ Profile']]){
+      const b=button(label,()=>home(id),tabs);b.setAttribute('aria-pressed',String(id===selectedTab));
+    }
     rosterRows=document.createElement('section');content.append(rosterRows);renderRelationships(roster);
     button('Refresh friends',home);
   }
@@ -65,6 +77,7 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
     const drafts=new Map([...rosterRows.querySelectorAll('textarea')].map(el=>[el.dataset.relationship,el.value]));
     rosterRows.replaceChildren();
     for(const r of roster.relationships){
+      if(selectedTab==='profile' || selectedTab==='requests' && !(r.state==='pending' && r.incoming) || selectedTab==='pending' && !(r.state==='pending' && !r.incoming))continue;
       const parent=document.createElement('section');rosterRows.append(parent);
       text(r.peer.name+' — '+r.state,parent);
       if(r.reason)text('Public request: '+r.reason,parent);
@@ -87,7 +100,7 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
     const header=document.createElement('header');header.className='friend-header';content.append(header);
     const avatar=document.createElement('span');avatar.className='buddy-avatar';avatar.textContent=rel.peer.name.slice(0,1).toUpperCase();avatar.setAttribute('aria-hidden','true');header.append(avatar);
     const name=document.createElement('h1');name.textContent=rel.peer.name;header.append(name);
-    button('Friends',home,header);
+    const back=button('Back',hide,header);back.onclick=()=>close.onclick();
     const help=document.createElement('section');help.className='friend-help';help.hidden=true;
     const helpButton=button('Help',async()=>{
       helpOpen=!helpOpen;help.hidden=!helpOpen;helpButton.setAttribute('aria-expanded',String(helpOpen));
@@ -164,6 +177,7 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
     for(const event of messageRows){
       const p=document.createElement('article');p.className=event.own?'owner':'resident';p.setAttribute('aria-label',event.own?'You':current.peer.name);
       const body=document.createElement('p');body.className='message-body';body.textContent=event.text;p.append(body);
+      if(native?.copyText)button('Copy',()=>native.copyText({text:event.text}),p).className='copy-message';
       const meta=document.createElement('small');meta.className='message-meta';
       const stamp=document.createElement('time');stamp.dateTime=new Date(event.created).toISOString();stamp.textContent=new Date(event.created).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});meta.append(stamp);
       if(event.own){
@@ -229,6 +243,13 @@ export function createFriendships({dialog,getTransport,getState,save,document,na
   async function hide(){if(busy)return;await save();closeImage();previews.clear();visible.reset();generation++;current=null;queued=false;dialog.close();content.replaceChildren();messageRows=[];onScope();}
   close.onclick=()=>hide().catch(()=>{notice.textContent='Could not save. Keep the dialog open.';});
   dialog.addEventListener('cancel',e=>{e.preventDefault();close.onclick();});
-  return {async open(){generation++;dialog.showModal();await run(home);onScope();},close:hide,refresh,
+  installEdgeBack(dialog,{enabled:()=>dialog.open && Boolean(current) && !busy && !helpOpen && !imageView,
+    back:()=>close.onclick(),allowDialog:true});
+  return {async open(id){generation++;dialog.showModal();await run(async()=>{
+    content.replaceChildren();
+    if(id){const roster=await request('roster');const rel=roster.relationships?.find(r=>r.id===id && r.state==='active' && !r.blocked);
+      if(rel)await chat(rel);else notice.textContent='This friendship is no longer active.';}
+    else await home();
+  });onScope();},close:hide,refresh,
     clear(){closeImage();previews.clear();visible.reset();generation++;current=null;queued=false;dialog.close();content.replaceChildren();messageRows=[];onScope();}};
 }

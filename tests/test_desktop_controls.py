@@ -38,6 +38,32 @@ class ControlsTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('PRIVATE', str(result))
         self.assertEqual(['thread/read'], [m for m, _ in self.calls])
 
+    async def test_recover_detaches_only_errored_connection(self):
+        self.state = 'systemError'
+        self.b.statuses = {}
+        self.client.close = AsyncMock()
+        original = self.client.request.side_effect
+        async def request(method, params):
+            if method == 'thread/unsubscribe':
+                self.calls.append((method, params))
+                return {'status': 'unsubscribed'}
+            return await original(method, params)
+        self.client.request.side_effect = request
+        receipt = await self.controls.handle('One', 'prepare', {'kind': 'recover'})
+        result = await self.controls.handle('One', 'confirm', {'ticket': receipt['ticket']})
+        self.assertTrue(result['accepted'])
+        self.assertEqual(self.b.clients, {})
+        self.client.close.assert_awaited_once()
+        self.assertEqual([m for m, _ in self.calls], ['thread/read','thread/read','thread/unsubscribe'])
+
+    async def test_recovery_rejects_state_change(self):
+        self.state = 'systemError'
+        receipt = await self.controls.handle('One', 'prepare', {'kind': 'recover'})
+        self.state = 'idle'
+        with self.assertRaises(IAMError):
+            await self.controls.handle('One', 'confirm', {'ticket': receipt['ticket']})
+        self.assertNotIn('thread/unsubscribe', [m for m, _ in self.calls])
+
     async def test_unattached_active_stop_uses_metadata_without_resume(self):
         self.state = 'active'; self.b.clients.clear()
         self.client.connect = AsyncMock(); self.client.close = AsyncMock()

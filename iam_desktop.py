@@ -40,6 +40,24 @@ def enabled() -> bool:
     return iam.CONFIG.exists() and iam.load(iam.CONFIG).get("desktop_enabled") is True
 
 
+def record_turn_failure(thread_id, turn):
+    """Allowlisted lifecycle evidence only; never save error text or tool payloads."""
+    if turn.get('status') != 'failed':
+        return
+    error = turn.get('error') or {}
+    category = error.get('codexErrorInfo')
+    if category not in ('other', 'badRequest', 'serverError', 'usageLimitExceeded'):
+        category = 'unclassified'
+    record = {'time': time.time(), 'thread_id': thread_id, 'turn_id': turn.get('id'),
+              'status': 'failed', 'category': category,
+              'knownBadRequest': error.get('message') == '{"detail":"Bad Request"}'}
+    try:
+        with (iam.ROOT / 'run' / 'turn-failures.jsonl').open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps(record) + '\n')
+    except OSError:
+        pass
+
+
 def control(action: str) -> bool:
     from urllib.request import Request, urlopen
     from urllib.parse import urlsplit
@@ -695,6 +713,10 @@ class DesktopBackend:
                 t = read.get('thread', {})
                 if t.get('id') != thread_id or Path(t.get('cwd', '')).resolve() != root:
                     raise IAMError("Pinned session workspace mismatch; no input sent")
+                if t.get('status', {}).get('type') == 'systemError':
+                    await client.close()
+                    self.statuses[owner] = 'session error'
+                    return {'state': 'error'}
                 if t.get('status', {}).get('type') == 'active':
                     # Do not change policy, take a writer, or steer somebody else's active turn.
                     await client.close()
@@ -748,6 +770,8 @@ class DesktopBackend:
                 return
             if message['method'] == 'turn/completed':
                 turn = params.get('turn')
+                if isinstance(turn, dict):
+                    record_turn_failure(thread_id, turn)
                 turn_id = turn.get('id') if isinstance(turn, dict) else params.get('turnId')
                 self.store.turn_completed(thread_id, turn_id)
                 receipt_wake=getattr(self,'friend_receipt_wake',None)
@@ -761,7 +785,7 @@ class DesktopBackend:
                 return
             if message['method'] == 'thread/status/changed':
                 status = params.get('status', {}).get('type')
-                self.statuses[owner] = ('approval needed' if 'waitingOnApproval' in params.get('status', {}).get('activeFlags', []) else {'idle': 'available', 'active': 'busy', 'notLoaded': 'not attached'}.get(status, 'unavailable'))
+                self.statuses[owner] = ('approval needed' if 'waitingOnApproval' in params.get('status', {}).get('activeFlags', []) else {'idle': 'available', 'active': 'busy', 'notLoaded': 'not attached', 'systemError': 'session error'}.get(status, 'unavailable'))
             else:
                 self.statuses[owner] = 'available' if message['method'] == 'turn/completed' else 'busy'
         client._desktop_status_callback = status_event
@@ -785,12 +809,13 @@ class DesktopBackend:
                 mobile = state == 'mobile_queued'
                 if mobile:
                     self.authorize_mobile(row['id'], row['thread_id'])
-                if (await self.open(mailbox))['state'] == 'busy':
+                if (await self.open(mailbox))['state'] in ('busy', 'error'):
                     return
                 client, thread_id = self.clients[owner]
                 metadata = await client.request('thread/read', {'threadId': thread_id, 'includeTurns': False})
-                if metadata.get('thread', {}).get('status', {}).get('type') != 'idle':
-                    self.statuses[owner] = 'busy'
+                runtime = metadata.get('thread', {}).get('status', {}).get('type')
+                if runtime != 'idle':
+                    self.statuses[owner] = {'active': 'busy', 'systemError': 'session error', 'notLoaded': 'not attached'}.get(runtime, 'unavailable')
                     return
                 entry = self.projects()[owner]
                 image_inputs = self.store.image_inputs(row['id'])
@@ -962,11 +987,10 @@ class DesktopBackend:
                     return dict(conversations=sorted(current),installation=config['node_id'],
                                 home=policy['home_server'],account=policy['owner_account_id'])
                 if operation=='invite':
-                    selected=args.get('conversations')
-                    if not isinstance(selected,list) or not set(selected).issubset(current):
-                        raise IAMError('Select current conversations')
+                    if args.get('desktop_scope') is not True:
+                        raise IAMError('Explicit approval of current and future desktop agents required')
                     return self.pairing_review.store.invite(policy['home_server'],policy['owner_account_id'],
-                        config['node_id'],set(selected),include_history=args.get('include_history'),now=int(time.time()))
+                        config['node_id'],current,include_history=args.get('include_history'),now=int(time.time()),desktop_scope=True)
                 if operation=='cancel-invite':
                     self.pairing_review.store.cancel_invitation(args['challenge'])
                     return dict(cancelled=True)
@@ -974,7 +998,7 @@ class DesktopBackend:
                     return self.pairing_review.prepare_invitation(args['challenge'],current,now=int(time.time()))
                 if operation=='confirm-invite':
                     self.pairing_review.confirm_invitation(args['ticket'],current,now=int(time.time()))
-                    return dict(approved=True,note='Phone approved for the reviewed conversations. Check approval on your phone.')
+                    return dict(approved=True,note='Phone approved for the reviewed scope. Desktop-wide links include current and future agents. Check approval on your phone.')
                 raise IAMError('Unsupported account pairing operation')
             if mailbox not in self.projects():
                 raise IAMError('Unknown mailbox')

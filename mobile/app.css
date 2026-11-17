@@ -1,4 +1,7 @@
 :root{color-scheme:dark;font:16px system-ui,sans-serif;background:#171923;color:#f5f5fb}*{box-sizing:border-box}body{margin:0;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left)}header{padding:20px;background:#454974;border-bottom:3px solid #eebc62}h1{font-size:1.5rem;margin:0}h2{font-size:1.15rem}main{padding:16px;max-width:650px;margin:auto}label{display:block;margin:16px 0}input,button{font:inherit;color:inherit;border:1px solid #62678a;border-radius:10px;padding:12px;background:#252837}input{display:block;width:100%;margin-top:6px}button{margin:6px 6px 6px 0;min-height:48px}button:disabled{opacity:.5}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#252837;padding:12px;border-radius:10px}p{line-height:1.5;overflow-wrap:anywhere}article{padding:16px;margin:14px 0;background:#252837;border-radius:16px;white-space:pre-wrap;overflow-wrap:anywhere}article.owner{background:#39334f;margin-left:24px}small{display:block;color:#bcc4ef}#status{border-left:3px solid #eebc62;padding:10px} [hidden]{display:none!important}
+.password-entry{display:flex;align-items:center;gap:8px;margin-top:-10px;margin-bottom:16px}
+.password-entry input{flex:1;min-width:0;margin:0}
+.password-entry button{flex:none;margin:0;min-width:64px}
 :root #composer{padding:16px;max-width:650px;margin:auto}
 textarea{display:block;width:100%;font:inherit;color:inherit;background:#252837;border:1px solid #62678a;border-radius:10px;padding:12px;resize:vertical}
 #photoPreview{display:block;max-width:100%;max-height:240px;object-fit:contain}#imageViewer{max-width:96vw;max-height:96vh;background:#171923;color:#fff;border:1px solid #62678a}#viewImage{display:block;max-width:85vw;max-height:80vh;object-fit:contain}dialog::backdrop{background:#000b}
@@ -103,6 +106,13 @@ body.chat-ready #status,body.chat-ready #liveStatus{display:none}
 .image-grid[data-count="3"] .image-tile:first-child{grid-column:1/-1}
 .image-grid .image-tile{min-width:0;min-height:0;width:100%;height:100%;margin:0;padding:0;border:0;border-radius:0;overflow:hidden;background:#303449;white-space:normal}
 .image-tile img{display:block;width:100%;height:100%;object-fit:cover}
+.buddy-owner{border-inline-start:4px solid #a99beb}
+.buddy-friend{border-inline-start:4px solid #72c9b3}
+.buddy-owner .buddy-info strong::after{content:' · Your Spark';font-size:.7em;color:#c9bdf6}
+.buddy-friend .buddy-info strong::after{content:' · Friend';font-size:.7em;color:#9be4d0}
+.copy-message{font-size:.75rem;padding:4px 8px;opacity:.85}
+.friend-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}
+.friend-tabs [aria-pressed=true]{border:2px solid #a99beb}
 .friend-image-view{position:absolute;inset:0;z-index:5;background:#171a24;display:flex;flex-direction:column;align-items:center;padding:12px;gap:8px}
 .friend-image-view img{width:100%;min-height:0;flex:1;object-fit:contain}
 @media(max-height:450px){.friend-chat .friend-header{padding:3px 10px}.friend-header .buddy-avatar{width:40px;height:40px}.friend-composer{padding:4px 10px;max-height:55%}}

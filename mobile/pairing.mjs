@@ -10,7 +10,7 @@ export function parseInvitation(code,home) {
   return value;
 }
 export function enrollConversations(state,invitation,result) {
-  if(!Array.isArray(result.conversations) || !result.conversations.length || result.conversations.length>64 ||
+  if(!Array.isArray(result.conversations) || (!result.desktopScope && !result.conversations.length) || result.conversations.length>1024 ||
       result.conversations.some(c=>typeof c!=='string' || !c || c.length>512))throw new Error('Invalid approved conversation list');
   const buddies=(state.buddies || []).map(b=>({...b}));
   for(const conversation of new Set(result.conversations)){
@@ -21,9 +21,26 @@ export function enrollConversations(state,invitation,result) {
     if(old){Object.assign(old,grant);delete old.pairing;}
     else buddies.push({installation:invitation.installation,conversation,...grant});
   }
-  if(buddies.length>64)throw new Error('Approval exceeds the 64 saved conversation limit');
+  if(buddies.length>1024)throw new Error('Approval exceeds the 1024 saved conversation limit');
   const next={...state,buddies};delete next.accountPairing;
+  if(result.desktopScope){
+    next.desktopLinks=[...(state.desktopLinks || []).filter(l=>l.installation!==invitation.installation),
+      {installation:invitation.installation,grantId:result.grantId,grantExpires:result.expiresAt}];
+  }
   const active=buddies.find(b=>b.installation===state.installation && b.conversation===state.conversation);
   if(active){Object.assign(next,{grantId:active.grantId,grantExpires:active.grantExpires,displayName:active.displayName});if(result.conversations.includes(state.conversation) && state.installation===invitation.installation)delete next.pairing;}
+  return next;
+}
+
+export function mergeDesktopRoster(state,link,roster){
+  const result={conversations:roster.map(r=>r.conversation),displayNames:Object.fromEntries(roster.map(r=>[r.conversation,r.displayName])),
+    grantId:link.grantId,expiresAt:link.grantExpires,desktopScope:true};
+  const next=enrollConversations(state,link,result);
+  // Keep drafts/history locally, but never keep access to removed registrations.
+  for(const buddy of next.buddies)if(buddy.installation===link.installation && buddy.grantId===link.grantId && !result.conversations.includes(buddy.conversation)){
+    delete buddy.grantId;delete buddy.grantExpires;
+    if(next.installation===buddy.installation && next.conversation===buddy.conversation){delete next.grantId;delete next.grantExpires;}
+  }
+  if(state.accountPairing)next.accountPairing=state.accountPairing;
   return next;
 }

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.6.0 - 2026-11-17
+
+- Follow the live IAM-owned app-server endpoint for new connections, including supervisor reconnects, instead of retaining a stale launch port.
+- Preserve app-server ownership after slow startup and improve coordinated shutdown handling without disabling saved connector preferences.
+- Add reviewed, session-scoped Messenger recovery controls for errored sessions while preserving their history and queued messages.
+- Add explicit opt-in desktop-wide phone pairing for current and future registered agents; existing limited grants remain limited.
+- Add per-friend incoming delivery allowances, cooldowns and pause settings while retaining owner consent and uncertainty holds.
+- Improve mailbox discovery for names containing spaces, read-through notice dismissal and privacy-safe turn-failure diagnostics.
+- Update Android pilot source with friend buddy lists, avatar caching, notification renewal and safer public error messages.
+
+The Python package includes Desktop source and assets; its optional Electron
+runtime still requires separate npm installation. Android changes are repository
+source, not a new signed APK or a claim of physical-device delivery verification.
+Endpoint discovery follows IAM ownership records; it does not scan arbitrary
+ports or automatically retarget already-open Codex remote terminals.
+
 ## 1.5.0 - 2026-10-31
 
 - Added optional Desktop IAM Messenger with a buddy list, separate conversation windows, profiles, attachment handling, delivery receipts, and scoped session controls.

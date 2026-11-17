@@ -33,6 +33,16 @@ not stop Codex's native managed daemon automatically.
 
 The default endpoint is `ws://127.0.0.1:4500`. To choose another port while IAM
 services are stopped, use `iam app-server-mode hidden-console --port 4521`.
+The saved port is a launch preference. Connections discover the live loopback
+URL from IAM's ownership record when its PID matches IAM's live app-server PID.
+The supervisor resolves that endpoint again for each new connection, rather
+than retaining the port from its launch. Explicit `--url` overrides remain
+pinned. Dead or mismatched ownership records do not redirect connections.
+This does not scan ports, adopt externally started servers, or automatically
+choose a different port when the launch port is occupied. Existing processes
+must load the updated code during an approved maintenance window; existing
+Codex remote terminals must be reopened after a server endpoint change.
+
 Only loopback URLs are generated. A reachable unverified listener is never
 silently adopted. Startup and opening terminals refuse to proceed while the
 native managed daemon's recorded PID is alive, even if the compatibility

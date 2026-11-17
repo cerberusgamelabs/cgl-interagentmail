@@ -65,6 +65,16 @@ def events_request(frame, config, store, desktop_path, *, now=None, streams=None
         else:
             proofs.consume(nonce=frame['nonce'],signature=frame['signature'],**args)
             grant=proofs.scope(frame['grant_id'],principal,config['node_id'],frame['conversation_id'],'events',now)
+            if frame['conversation_id']=='@desktop':
+                if query!={'read':[]}:
+                    raise AccessDenied('Discovery is read-only')
+                names=sorted(grant.conversation_ids-{'@desktop'})
+                roster_value=[dict(conversation=c,display_name=conversation_name(c)) for c in names]
+                if len(json.dumps(roster_value).encode('utf-8'))>120000:
+                    raise AccessDenied('Desktop roster exceeds transport bounds')
+                result.update(unread=0,subscriptions=[],desktop_roster=roster_value)
+                proofs.scope(frame['grant_id'],principal,config['node_id'],'@desktop','events',int(time.time()) if live_clock else now)
+                return result
             desktop=DesktopStore(desktop_path)
             with desktop.connect() as db:
                 db.execute('BEGIN IMMEDIATE')
@@ -265,9 +275,12 @@ def pairing_request(frame, config, store, *, now=None):
                 or frame['installation_id'] != config.get('node_id')):
             raise AccessDenied('scope')
         if status:
-            result.update(store.status(frame['challenge'], principal, config['node_id'], now=now))
-            if result.get('state') == 'approved' and result.get('conversations'):
-                result['display_names'] = {c: conversation_name(c) for c in result['conversations']}
+            value=store.status(frame['challenge'], principal, config['node_id'], now=now)
+            if value.get('state') == 'approved' and value.get('conversations'):
+                value['display_names'] = {c: conversation_name(c) for c in value['conversations']}
+            if len(json.dumps(value).encode('utf-8'))>120000:
+                raise AccessDenied('Desktop roster exceeds transport bounds')
+            result.update(value)
         elif claim:
             result.update(store.claim_invitation(frame['challenge'],principal,config['node_id'],frame['owner_key'],now=now))
         else:

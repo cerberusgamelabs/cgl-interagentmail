@@ -30,12 +30,19 @@ public class OwnerDevicePlugin extends Plugin {
         "/v1/messenger/friends/self","/v1/messenger/friends/roster","/v1/messenger/friends/invite",
         "/v1/messenger/friends/discover","/v1/messenger/friends/request","/v1/messenger/friends/decide",
         "/v1/messenger/friends/send","/v1/messenger/friends/history","/v1/messenger/friends/read",
-        "/v1/messenger/friends/listen","/v1/messenger/friends/attachment","/v1/messenger/friends/typing",
+        "/v1/messenger/friends/listen","/v1/messenger/friends/attachment","/v1/messenger/friends/typing","/v1/messenger/friends/notifications",
         "/v1/messenger/events/challenge","/v1/messenger/events/sync",
         "/v1/messenger/pairing/request","/v1/messenger/pairing/status","/v1/messenger/pairing/claim","/v1/messenger/history/challenge","/v1/messenger/history/read",
         "/v1/messenger/send/challenge","/v1/messenger/send/submit",
         "/v1/messenger/attachment/challenge","/v1/messenger/attachment/transfer");
     @Override public void load(){vault=new DeviceVault(getContext(),"iam-v1");}
+    @PluginMethod public void copyText(PluginCall call){
+        String text=call.getString("text");
+        if(!foreground || text==null || text.length()>1000000){call.reject("Copy unavailable");return;}
+        android.content.ClipboardManager clipboard=(android.content.ClipboardManager)getContext().getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("IAM message",text));
+        call.resolve();
+    }
     private synchronized void stopStream(){streamGeneration++;if(streamConnection!=null)streamConnection.disconnect();streamConnection=null;}
     @PluginMethod public void closeStream(PluginCall call){stopStream();call.resolve();}
     @PluginMethod public void openStream(PluginCall call){

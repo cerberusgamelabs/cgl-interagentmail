@@ -24,12 +24,12 @@ test('friend routes are explicitly allowlisted without opening arbitrary native 
   const calls=[];
   const fetch=nativeFetch({request:async value=>{calls.push(value);return {status:200,body:'{}'};}},'https://example.test');
   const options={method:'POST',redirect:'error',headers:{Authorization:'Bearer '+'t'.repeat(43)},body:'{}'};
-  for(const operation of ['self','roster','invite','discover','request','decide','send','history','read','listen'])
+  for(const operation of ['self','roster','invite','discover','request','decide','send','history','read','listen','notifications'])
     await fetch('https://example.test/v1/messenger/friends/'+operation,options);
-  assert.equal(calls.length,10);
+  assert.equal(calls.length,11);
   for(const path of ['admin','authorize','history?account=other','send/extra'])
     await assert.rejects(fetch('https://example.test/v1/messenger/friends/'+path,options));
-  assert.equal(calls.length,10);
+  assert.equal(calls.length,11);
 });
 
 test('late native response is discarded after timeout/abort',async()=>{

@@ -1,6 +1,18 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {MessengerTransport} from '../transport.mjs';
+test('reauthentication sends previous credential only to the selected HTTPS login endpoint',async()=>{
+  let sent;
+  const transport=new MessengerTransport('https://example.test',{fetchImpl:async(url,options)=>{
+    sent={url,body:JSON.parse(options.body)};
+    return {ok:true,json:async()=>({token:'b'.repeat(43),expiresAt:Date.now()+60000,deviceId:'same',account_id:'owner',home_server:'home'})};
+  }});
+  await transport.login('owner@example.test','password','phone','a'.repeat(43));
+  assert.equal(sent.body.previous_token,'a'.repeat(43));
+  assert.equal(sent.url,'https://example.test/v1/messenger/login');
+  await transport.login('owner@example.test','password','phone');
+  assert.equal(Object.hasOwn(sent.body,'previous_token'),false);
+});
 test('status returns only scoped grant fields and rejects malformed approval',async()=>{
   let value={state:'approved',grant_id:'g'.repeat(43),expires_at:Math.floor(Date.now()/1000)+300,private:'hidden'};
   const transport=new MessengerTransport('https://example.test',{fetchImpl:async()=>({ok:true,json:async()=>value})});
