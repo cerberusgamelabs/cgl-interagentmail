@@ -14,6 +14,7 @@ streams=ForegroundStreams()
 
 root=Path(sys.argv[1])
 store=Pairings(root/'pairings.db')
+store.desktop_conversations=lambda: ['pilot']
 desktop=root/'desktop.db'
 DesktopStore(desktop)
 with sqlite3.connect(desktop) as db:
@@ -38,7 +39,8 @@ def handle(data):
     if data.get('command')=='approve':
         pending=store.inspect(data['challenge'],now=now)
         return {'grant':store.approve(data['challenge'],Principal(**pending['principal']),'node',{'pilot'},
-            now=now,expires_at=now+600,history_from=0,expected_owner_key=pending['owner_key'])}
+            now=now,expires_at=now+600,history_from=0,expected_owner_key=pending['owner_key'],
+            desktop_scope=data.get('desktop_scope') is True)}
     if data.get('command')=='revoke':
         store.revoke(data['grant']);return {'revoked':True}
     if data['type'].startswith('messenger_pairing_'):

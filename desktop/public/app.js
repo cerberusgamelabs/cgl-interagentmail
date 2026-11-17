@@ -4,6 +4,9 @@ const headerPortrait = document.createElement('span'); headerPortrait.id = 'head
 if (mailbox !== 'buddies') document.querySelector('header .logo').replaceWith(headerPortrait);
 const call = (action, args) => window.iam.call(action, args);
 if(mailbox==='buddies') {
+  const computers=document.createElement('button');computers.textContent='Link another computer';
+  computers.onclick=()=>call('remote-window',{}).catch(e=>toastNotice(e.message));
+  $('roster').prepend(computers);
   const connect=document.createElement('button');connect.textContent='Connect phone';
   connect.onclick=()=>call('control-window',{mailbox,kind:'pairing'}).catch(e=>toastNotice(e.message));
   $('roster').prepend(connect);

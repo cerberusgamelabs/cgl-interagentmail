@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, Menu, Tray, nativeImage, clipboard, screen, dialog, shell, crashReporter, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, session, Menu, Tray, nativeImage, clipboard, screen, dialog, shell, crashReporter, powerMonitor, safeStorage } = require('electron');
 const express = require('express');
 const { spawn } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
@@ -22,6 +22,14 @@ const viewerDocuments = new Map();
 const humanFriends = new Map();
 const controlKinds = new Set(['status', 'compact', 'stop', 'model', 'plan', 'permissions', 'more', 'pairing', 'external-contact', 'friends']);
 let backend, backendRpc, server, origin, tray, stopping = false;
+let remoteWindow;
+const remoteDesktop=new (require('./remote-desktop.cjs').RemoteDesktop)({safeStorage,
+  file:path.join(root,'run','remote-desktop.secure'),config:()=>rpc('federation-config')});
+const isRemote=mailbox=>typeof mailbox==='string' && mailbox.startsWith('remote:');
+async function combinedSnapshot() {
+  const local=await rpc('snapshot');remoteDesktop.refresh();
+  return {...local,buddies:[...local.buddies,...remoteDesktop.buddies]};
+}
 const smoke = process.argv.includes('--smoke-test');
 const layoutFile = path.join(root, 'run', 'desktop-windows.json');
 let restoring = true;
@@ -69,7 +77,7 @@ function windowFor(mailbox, saved) {
   win.webContents.on('will-navigate', (event) => event.preventDefault());
   win.on('close', event => { if (buddy && !stopping) { event.preventDefault(); win.hide(); } });
   const windowId = String(win.id);
-  const trackWindow = opened => rpc('chat-window', {mailbox, window_id: windowId, opened});
+  const trackWindow = opened => isRemote(mailbox)?Promise.resolve():rpc('chat-window', {mailbox, window_id: windowId, opened});
   const registeredWindow = buddy ? Promise.resolve() : trackWindow(true).catch(error => {
     diagnostics.event('chat-window-register-failed', {errorType:error.name});
   });
@@ -153,6 +161,39 @@ app.whenReady().then(async () => {
     if (action === 'chat-window') throw new Error('Window lifecycle is main-process owned');
     if (event.senderFrame !== event.sender.mainFrame || !event.senderFrame.url.startsWith(origin + '/')) throw new Error('Untrusted window');
     if (Buffer.byteLength(JSON.stringify(args)) > (action === 'send' ? 12000000 : 100000)) throw new Error('Request too large');
+    if(action==='remote-window') {
+      const sender=new URL(event.senderFrame.url);
+      if(sender.pathname!=='/' || sender.searchParams.get('mailbox')!=='buddies')throw Error('Open linking from the buddy list.');
+      if(remoteWindow && !remoteWindow.isDestroyed()){remoteWindow.show();remoteWindow.focus();return true;}
+      remoteWindow=new BrowserWindow({icon: appIcon,width:540,height:650,title:'Link another computer',
+        webPreferences:{preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,contextIsolation:true,sandbox:true,webSecurity:true}});
+      remoteWindow.webContents.setWindowOpenHandler(()=>({action:'deny'}));
+      remoteWindow.webContents.on('will-navigate',e=>e.preventDefault());
+      remoteWindow.on('closed',()=>{remoteWindow=null;});remoteWindow.loadURL(origin+'/remote.html');return true;
+    }
+    if(action==='remote-setup') {
+      if(!remoteWindow || event.sender!==remoteWindow.webContents || screenLocked)throw Error('Use the unlocked computer-linking window.');
+      if(args.operation==='status')return remoteDesktop.status();
+      if(args.operation==='login')return remoteDesktop.login(args.email,args.password);
+      if(args.operation==='pair')return remoteDesktop.pair(args.node);
+      if(args.operation==='check')return remoteDesktop.check(args.node);
+      if(args.operation==='logout') {
+        const answer=await dialog.showMessageBox(remoteWindow,{type:'warning',message:'Sign out and remove this computer’s saved remote links and queued drafts?',buttons:['Cancel','Sign out'],defaultId:0,cancelId:0});
+        return answer.response===1?remoteDesktop.logout():{cancelled:true};
+      }
+      throw Error('Unknown linking operation.');
+    }
+    if(action==='snapshot')return combinedSnapshot();
+    if(isRemote(args.mailbox)) {
+      const sender=new URL(event.senderFrame.url);
+      if(sender.pathname!=='/' || (sender.searchParams.get('mailbox')!==args.mailbox && action!=='window'))throw Error('Remote conversation window mismatch.');
+      if(action==='window') {remoteDesktop.find(args.mailbox);windowFor(args.mailbox);return true;}
+      if(action==='history')return remoteDesktop.history(args.mailbox);
+      if(action==='mark-read')return remoteDesktop.markRead(args.mailbox,args.event_ids);
+      if(action==='send') {if(screenLocked)throw Error('Unlock this computer before sending.');return remoteDesktop.send(args.mailbox,args);}
+      if(['open','ensure-session','session-readiness'].includes(action)){await remoteDesktop.prepare();remoteDesktop.find(args.mailbox);return {state:action==='open'?'attached':'bound'};}
+      throw Error('Remote runtime controls are not available; use the agent’s home computer.');
+    }
     if(action==='human-friends' || action==='agent-friend-roster'){
       const sender=new URL(event.senderFrame.url),mailbox=sender.searchParams.get('mailbox');
       if(sender.pathname!=='/controls.html' || sender.searchParams.get('kind')!=='friends' || args.mailbox!==mailbox)throw Error('Friend requests require their dedicated window');
@@ -310,7 +351,7 @@ app.whenReady().then(async () => {
       try { const value = JSON.parse(fs.readFileSync(file, 'utf8')).value; return value === 'light' ? 'light' : 'dark'; }
       catch { return 'dark'; }
     }
-    if (action === 'window') { const roster=await rpc('snapshot'); if (!roster.buddies.some(b=>b.mailbox===args.mailbox)) throw new Error('Unknown buddy'); windowFor(args.mailbox); return true; }
+    if (action === 'window') { const roster=await combinedSnapshot(); if (!roster.buddies.some(b=>b.mailbox===args.mailbox)) throw new Error('Unknown buddy'); windowFor(args.mailbox); return true; }
     if (!['snapshot','history','open','send','approval','decide','dismiss-notice'].includes(action)) throw new Error('Unsupported operation');
     return rpc(action,args);
   });

@@ -1023,6 +1023,20 @@ class DesktopBackend:
             return self.store.published_image(args['mailbox'], args['kind'], args['message_id'], args['index'])
         if action == 'session-control':
             return await self.controls.handle(args['mailbox'], args['operation'], args)
+        if action == 'federation-config':
+            from iam_webconnect import config_path
+            from urllib.parse import urlparse
+            config = iam.load(config_path()) if config_path().exists() else {}
+            policy = config.get('federation', {})
+            if config.get('enabled') is not True or policy.get('enabled') is not True:
+                return {'enabled': False}
+            from iam_federation import policy as validate_federation
+            validate_federation(config, self.projects())
+            origin = urlparse(config['server_url'])
+            if origin.scheme != 'wss' or origin.username or origin.password:
+                raise IAMError('Remote desktop requires a secure WebConnect origin')
+            return dict(enabled=True, origin='https://' + origin.netloc, owner=policy['owner_account_id'],
+                        node=config['node_id'], epoch=policy['epoch'], peers=policy['peers'])
         if action == 'snapshot':
             config = await self.roster_config()
             with self.store.connect() as db:

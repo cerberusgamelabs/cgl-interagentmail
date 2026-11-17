@@ -32,6 +32,53 @@ the primary execution settings apply. Workspace mismatch fails closed.
 
 ## What reaches the window
 
+### Same-account computers (1.7)
+
+Cross-PC operation requires the matching WebConnect relay update and separate
+node credentials on each PC, owned by the same account. Friends and delegated
+accounts are not node owners and cannot enroll a shared system. Never copy the
+other PC's node credentials or live databases.
+
+After installing the updated package and registering the agents that belong on
+each machine, enroll explicit peers on each PC. Replace the example identifiers:
+
+```powershell
+iam federation configure --peer OTHER_NODE_ID --mailbox LOCAL_AGENT --allow-owner-chat
+iam federation status
+```
+
+Repeat `--peer` and `--mailbox` as needed. Omitting `--mailbox` exports no agent
+mailboxes. The owner identity is read from the authenticated relay, not supplied
+as a user assertion. The command does not restart anything. At an agreed safe
+time reload only `iam connect stop` / `iam connect start` and
+`iam desktop stop` / `iam desktop start`; shared IAM/Codex restart is unnecessary.
+
+In the buddy list select **Link another computer**, sign in with the owning
+WebConnect account, select the peer, and request pairing. On the peer computer,
+use **Connect phone** (the existing device-review dialog also handles desktops)
+to review and approve the pending device with explicit desktop-roster scope.
+Then use **Check approval** on the requesting computer. Repeat in the other
+direction if both desktops should display the whole team. Credentials and P-256
+keys remain in OS-protected main-process storage; insecure plaintext fallbacks
+are rejected. Each remote buddy is namespaced by node to prevent name collisions.
+
+Remote chat is a text pilot: the signed request envelope is limited to 3 KB.
+Attachments and remote runtime/session/approval controls are rejected. Agent mail
+supports normal-priority, single-recipient text with thread continuity; mixed
+local/remote fanout and attachments are rejected before local publication.
+An offline owner draft is retained for up to 24 hours. An uncertain send is
+looked up by its immutable request ID before retry; a new grant cannot inherit
+old pending drafts. A relay receipt never claims an agent has read or answered.
+
+`iam federation disable` stops local mail routing and requests relay unlinking.
+If the relay is unavailable, local routing is disabled but remote revocation is
+unconfirmed: repeat the command once reachable. Device grants are separate:
+revoke them in the receiving computer's **Connect phone** review, or sign out
+in the sending computer's linking window. Signing out removes its saved remote
+links and drafts after a confirmation dialog. No agent migration is automatic.
+
+## Local conversation contents
+
 Conversation bubbles support a small Markdown subset: bold, italics, simple
 bullet/numbered lists, inline code and fenced code blocks. Rendering creates only
 text nodes and fixed formatting elements; raw HTML, links and image embeds remain

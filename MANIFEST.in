@@ -12,6 +12,7 @@ include scripts/check_installed_modules.py
 include scripts/check_python_regression.py
 recursive-include tests *.py
 recursive-include desktop *.cjs *.json *.html *.css *.js
+recursive-include desktop/remote *.mjs
 recursive-include desktop/assets *.png *.ico
 recursive-include desktop/public/emoji *.png *.txt
 exclude docs/DESKTOP_099_READINESS.md

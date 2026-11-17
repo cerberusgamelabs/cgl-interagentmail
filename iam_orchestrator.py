@@ -2998,6 +2998,14 @@ def parser() -> argparse.ArgumentParser:
     web_password.set_defaults(func=cmd_web_password)
 
     connect = sub.add_parser("connect", help="Manage the outbound WebConnect transport client.")
+    federation = sub.add_parser('federation', help='Link same-account computers through WebConnect (opt-in).')
+    federation_sub = federation.add_subparsers(dest='operation', required=True)
+    federation_configure = federation_sub.add_parser('configure', help='Enroll selected peers without restarting services.')
+    federation_configure.add_argument('--peer', action='append', required=True)
+    federation_configure.add_argument('--mailbox', action='append', default=[])
+    federation_configure.add_argument('--allow-owner-chat', action='store_true')
+    for operation in (federation_configure, federation_sub.add_parser('status'), federation_sub.add_parser('disable')):
+        operation.set_defaults(func=lambda args: __import__('iam_federation_setup').run(args))
     connect_sub = connect.add_subparsers(dest="connect_command", required=True)
     connect_configure = connect_sub.add_parser("configure", help="Configure a compatible WebConnect server and bound human mailbox.")
     connect_configure.add_argument("--server-url", required=True)

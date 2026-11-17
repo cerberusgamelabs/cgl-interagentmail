@@ -442,6 +442,11 @@ class WebConnectClient:
             directory = self.mailbox_directory()
             LOG.info("Publishing %d registered project mailbox(es).", len(directory["mailboxes"]))
             await socket.send(json.dumps(directory))
+            federation = None
+            if self.config.get('federation', {}).get('enabled') is True:
+                from iam_federation import MailQueue, Session
+                federation = Session(MailQueue(iam.ROOT / 'run' / 'federation.sqlite3',
+                    self.config, self.project_mailboxes()), iam.ROOT)
             next_directory_check = time.monotonic() + 30
             next_push_check = 0
             from iam_messenger_stream import ForegroundStreams
@@ -451,6 +456,22 @@ class WebConnectClient:
                 await socket.send(json.dumps(frame))
             next_health_check = 0
             while True:
+                if federation is not None and not federation.blocked:
+                    from iam_federation import FederationError
+                    try:
+                        # A changed local opt-in stops this session; never hot-adopt new scope.
+                        current = iam.load(config_path())
+                        if (current.get('enabled') is not True or
+                                current.get('federation') != self.config.get('federation') or
+                                current.get('node_id') != self.config.get('node_id') or
+                                current.get('server_url') != self.config.get('server_url') or
+                                not set(federation.queue.policy['mailboxes']).issubset(self.project_mailboxes())):
+                            raise FederationError('Federation scope changed')
+                        update = federation.next_frame()
+                        if update: await socket.send(json.dumps(update, ensure_ascii=False))
+                    except (FederationError, OSError, ValueError, sqlite3.Error):
+                        federation.blocked = True
+                        LOG.warning('Federation paused; local review required. No message content logged.')
                 if time.monotonic() >= next_health_check:
                     await verify_relay(socket, self.config)
                     next_health_check = time.monotonic() + 10
@@ -492,7 +513,13 @@ class WebConnectClient:
                     self.queue_replies()
                     for frame in self.relay_outbound(): await socket.send(json.dumps(frame))
                     continue
-                if frame.get('type') == 'messenger_friend_changed':
+                if frame.get('type') == 'federation_result':
+                    if federation is not None and not federation.blocked:
+                        try: federation.receive(frame)
+                        except (ValueError, TypeError, KeyError, OSError, sqlite3.Error):
+                            federation.blocked = True
+                            LOG.warning('Federation paused; local review required. No message content logged.')
+                elif frame.get('type') == 'messenger_friend_changed':
                     from iam_messenger_friend_delivery import FriendQueue
                     from iam_orchestrator import registered_projects
                     config=load_config()

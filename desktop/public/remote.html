@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Link another computer</title></head>
+<body><h1>Link another computer</h1>
+<p>Both computers must belong to the same WebConnect account and explicitly allow each other. Approve this device on the other computer before any remote owner chat is allowed.</p>
+<form id="login"><label>Email <input id="email" type="email" autocomplete="username" required></label><br>
+<label>Password <input id="password" type="password" autocomplete="current-password" required></label><br><button>Sign in</button></form>
+<p>Credentials and signing keys are kept in protected operating-system storage, not in chat or the browser renderer.</p>
+<label>Computer <select id="peer"></select></label>
+<button id="pair" type="button">Request pairing</button><button id="check" type="button">Check approval</button>
+<button id="logout" type="button">Sign out / remove links</button>
+<p id="status" role="status"></p>
+<p>Current scope: text chat. Attachments and remote session controls are not enabled. Queued owner drafts expire after 24 hours; uncertain sends are checked by request ID before resending.</p>
+<script src="remote-setup.js"></script></body></html>

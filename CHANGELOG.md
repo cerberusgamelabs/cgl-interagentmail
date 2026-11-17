@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.7.0 - 2026-11-17
+
+- Add opt-in, same-account WebConnect computer enrollment and durable single-recipient text mail across explicitly linked nodes.
+- Add remote buddies and signed owner text chat to Desktop using the existing locally approved Messenger device protocol and protected OS credential storage.
+- Queue remote owner drafts for up to 24 hours; verify uncertain sends by stable request ID before resending. Consent changes fence old queues rather than silently retargeting them.
+- Reject cross-account routes and ambiguous mailbox names; distinguish relay receipt from recipient delivery and hold uncertain inbox publication for review.
+
+Requires coordinated relay/client updates and explicit enrollment and pairing on
+both computers. This release does not migrate agents or share files, runtime
+controls, or approval authority. Cross-PC text pilot: one agent-mail recipient,
+normal priority, no attachments/forwarded metadata; owner chat uses the existing
+3 KB signed-text limit. Remote chat cannot approve runtime actions. Physical
+two-PC rollout remains unverified until owner pairing is completed.
+
 ## 1.6.0 - 2026-11-17
 
 - Follow the live IAM-owned app-server endpoint for new connections, including supervisor reconnects, instead of retaining a stale launch port.

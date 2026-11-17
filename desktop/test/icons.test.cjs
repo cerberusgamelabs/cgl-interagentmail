@@ -21,7 +21,7 @@ test('Windows icon contains all expected PNG sizes', () => {
 });
 test('all desktop windows and tray use the approved icon', () => {
   const source = fs.readFileSync(path.join(__dirname, '../main.cjs'), 'utf8');
-  assert.equal((source.match(/new BrowserWindow\(/g) || []).length, 4);
-  assert.equal((source.match(/new BrowserWindow\(\{icon: appIcon/g) || []).length, 4);
+  assert.equal((source.match(/new BrowserWindow\(/g) || []).length, 5);
+  assert.equal((source.match(/new BrowserWindow\(\{icon: appIcon/g) || []).length, 5);
   assert.ok(source.includes('new Tray(appIcon)'));
 });

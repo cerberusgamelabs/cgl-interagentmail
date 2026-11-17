@@ -187,6 +187,16 @@ def send_message(
 ) -> dict:
     if not to:
         raise SystemExit("At least one --to recipient is required.")
+    federation_config = ROOT / 'webconnect.json'
+    if federation_config.exists() and load(federation_config).get('federation', {}).get('enabled') is True:
+        from iam_federation import route_mail, FederationError
+        try:
+            remote = route_mail(sender, to, cc, subject, body, attach, thread, reply_to,
+                                originator, refs, priority, metadata, delivery_key)
+        except FederationError as exc:
+            raise SystemExit(str(exc)) from None
+        if remote is not None:
+            return remote
     priority = normalize_priority(priority)
     for name in [sender, *to, *cc]:
         ensure_box(name)
@@ -263,6 +273,12 @@ def validate_delivery_key(key: str):
 def send_receipt(sender: str, key: str) -> dict:
     """Metadata only. Unknown is NOT proof that historical mail was not sent."""
     validate_delivery_key(key)
+    config_path = ROOT / 'webconnect.json'
+    if config_path.exists() and load(config_path).get('federation', {}).get('enabled') is True:
+        from iam_federation import delivery_receipt
+        remote = delivery_receipt(sender, key)
+        if remote is not None:
+            return remote
     db = receipt_connection(sender)
     try:
         row = db.execute("SELECT state,payload FROM receipts WHERE key=?", (key,)).fetchone()
