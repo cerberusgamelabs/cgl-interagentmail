@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import sqlite3
 from iam_messenger_access import AccessDenied, Principal
 from iam_messenger_pairing import Pairings
@@ -31,7 +32,7 @@ class PairingTests(unittest.TestCase):
 
     def test_old_schema_migration_never_promotes_existing_grants(self):
         old_path=Path(self.temp.name)/'old.db'
-        with sqlite3.connect(old_path) as db:
+        with closing(sqlite3.connect(old_path)) as db, db:
             db.execute('CREATE TABLE pairing_grants (id TEXT PRIMARY KEY, identity TEXT NOT NULL, installation TEXT NOT NULL, conversations TEXT NOT NULL, expires INTEGER NOT NULL, history_from INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0)')
             db.execute('INSERT INTO pairing_grants VALUES (?,?,?,?,?,?,0)',('old',self.store.identity(self.person),'installation','["ophelia"]',1000,0))
         migrated=Pairings(old_path)
