@@ -10,6 +10,17 @@ from iam_messenger_reads import mark
 
 
 class StreamTests(HistoryTests):
+    def test_permanent_grant_still_requires_stream_renewal(self):
+        from iam_messenger_access import Principal
+        with self.store.connection() as db:
+            db.execute('UPDATE pairing_grants SET expires=0 WHERE id=?',(self.frame['grant_id'],))
+        streams=ForegroundStreams()
+        lease=streams.subscribe('stream',Principal(**self.frame['principal']),'node','pilot',
+            self.frame['grant_id'],self.store,2000)
+        self.assertEqual(lease['expires_at'],2300)
+        self.assertEqual(streams.updates(DesktopStore(self.path),self.store,self.config,2300)[0]['state'],'ended')
+        self.assertEqual(streams.leases,{})
+
     def test_signed_subscription_change_only_read_and_revocation(self):
         streams=ForegroundStreams();desktop=DesktopStore(self.path)
         stream_id='00000000-0000-4000-8000-000000000001'

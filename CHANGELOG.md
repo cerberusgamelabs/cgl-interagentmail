@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.8.0 - 2026-11-24
+
+- Update Electron and the locked body-parser dependency to address GHSA-jr5w-w6x2-84p9 and GHSA-27r3-jxmh-p828.
+
+- Add review-first `iam migration export/import/check/relocate`: selected mailbox and Messenger-profile bundles, optional workspaces/pinned rollouts, checksummed safe staging, destination path drafts, and explicit idle-session relocation. No automatic live installation, credential transfer, service restart, or cutover; see `docs/MIGRATION.md` for boundaries.
+- Add personal buddy-list groups, compact tools with separate settings windows, friendlier dropdown styling, and local-day separators in conversations.
+- Keep the initial desktop history window to 50 messages and load older messages by scrolling. Share desktop update polling across windows and use history revisions/indexed unread counts to reduce redundant work; this is not a polling-free push transport.
+- Fix desktop runtime-data-folder propagation and add sanitized backend startup diagnostics.
+
+- Make new key-bound owner phone and desktop pairings valid until owner revocation, including global desktop scope. Retain expiring login sessions, invitations, signing challenges and stream leases.
+- Accept explicit permanent approvals across the desktop, mobile client and WebConnect gateway. Missing expiry data is rejected; legacy timed and revoked grants are not silently renewed.
+- Requires coordinated backend, relay and mobile updates. Expired legacy global pairings require one fresh owner approval; no per-conversation renewal is needed for desktop-wide access.
+- Includes Android 0.9.9i-pilot source (code 31); this Python release does not install or update a phone APK or deploy a WebConnect relay.
+
 ## 1.7.0 - 2026-11-17
 
 - Add opt-in, same-account WebConnect computer enrollment and durable single-recipient text mail across explicitly linked nodes.

@@ -11,6 +11,8 @@ const {saveAttachment} = require('./attachment-save.cjs');
 const {contextMenuItems} = require('./context-menu.cjs');
 
 const root = path.resolve(__dirname, '..');
+const {runtimeRoot,preserveLegacyState}=require('./runtime-paths.cjs');
+const dataRoot=runtimeRoot(process.env);
 const appIcon = path.join(__dirname, 'assets', 'iam-messenger.ico');
 app.setAppUserModelId('xyz.cerberusgamelabs.iam-messenger');
 const token = randomBytes(32).toString('hex');
@@ -20,18 +22,23 @@ const controlWindows = new Map();
 const viewerImages = new Map();
 const viewerDocuments = new Map();
 const humanFriends = new Map();
-const controlKinds = new Set(['status', 'compact', 'stop', 'model', 'plan', 'permissions', 'more', 'pairing', 'external-contact', 'friends']);
+const controlKinds = new Set(['status', 'compact', 'stop', 'model', 'plan', 'permissions', 'more', 'pairing', 'external-contact', 'friends', 'groups']);
 let backend, backendRpc, server, origin, tray, stopping = false;
 let remoteWindow;
 const remoteDesktop=new (require('./remote-desktop.cjs').RemoteDesktop)({safeStorage,
-  file:path.join(root,'run','remote-desktop.secure'),config:()=>rpc('federation-config')});
+  file:path.join(dataRoot,'run','remote-desktop.secure'),config:()=>rpc('federation-config')});
 const isRemote=mailbox=>typeof mailbox==='string' && mailbox.startsWith('remote:');
 async function combinedSnapshot() {
   const local=await rpc('snapshot');remoteDesktop.refresh();
   return {...local,buddies:[...local.buddies,...remoteDesktop.buddies]};
 }
+const updateFeed=require('./update-feed.cjs').createUpdateFeed(combinedSnapshot, snapshot=>{
+  for(const win of windows.values()) {
+    if(!win.isDestroyed()) win.webContents.send('iam:update',snapshot);
+  }
+});
 const smoke = process.argv.includes('--smoke-test');
-const layoutFile = path.join(root, 'run', 'desktop-windows.json');
+const layoutFile = path.join(dataRoot, 'run', 'desktop-windows.json');
 let restoring = true;
 function saveWindows() {
   if (smoke || restoring) return;
@@ -40,7 +47,8 @@ function saveWindows() {
   catch { console.error('Could not save desktop window layout.'); }
 }
 if (!app.requestSingleInstanceLock()) { app.exit(0); return; }
-const diagnostics=require('./diagnostics.cjs').installDiagnostics({app,crashReporter,directory:path.join(root,'run','desktop-crashes')});
+preserveLegacyState(root,dataRoot);
+const diagnostics=require('./diagnostics.cjs').installDiagnostics({app,crashReporter,directory:path.join(dataRoot,'run','desktop-crashes')});
 app.on('second-instance', () => windowFor('buddies'));
 app.on('web-contents-created', (_event, contents) => {
   contents.on('context-menu', (_event, params) => {
@@ -134,8 +142,8 @@ app.whenReady().then(async () => {
   api.use(express.static(path.join(__dirname,'public'), {dotfiles:'deny'}));
   server = await new Promise(resolve => { const s=api.listen(0,'127.0.0.1',()=>resolve(s)); });
   origin = `http://127.0.0.1:${server.address().port}`;
-  fs.mkdirSync(path.join(root,'run'),{recursive:true});
-  fs.writeFileSync(path.join(root,'run','desktop-control.json'),JSON.stringify({url:origin,token,pid:process.pid}),{mode:0o600});
+  fs.mkdirSync(path.join(dataRoot,'run'),{recursive:true});
+  fs.writeFileSync(path.join(dataRoot,'run','desktop-control.json'),JSON.stringify({url:origin,token,pid:process.pid}),{mode:0o600});
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     callback({cancel: !details.url.startsWith(origin + '/') && !details.url.startsWith('data:image/')});
   });
@@ -145,12 +153,13 @@ app.whenReady().then(async () => {
   });
   const python = process.env.IAM_DESKTOP_PYTHON;
   if (!python) throw new Error('Start with iam desktop start so the configured Python runtime is used.');
-  backend = spawn(python, ['-X','utf8','-u','-m','iam_desktop'], {cwd: root, windowsHide: true, stdio:['pipe','pipe','pipe']});
+  const {bootstrap,watchStartup}=require('./backend-startup.cjs');
+  backend = spawn(python, ['-X','utf8','-u','-c',bootstrap], {cwd: root, env:{...process.env,INTERAGENTMAIL_HOME:dataRoot}, windowsHide: true, stdio:['pipe','pipe','pipe']});
   backendRpc = createBackendRpc(backend);
   diagnostics.event('backend-started',{processId:backend.pid});
   backend.on('error',error=>diagnostics.event('backend-error',{errorType:error.name}));
   // Never echo backend content or transcript-bearing protocol errors into a renderer.
-  backend.stderr.on('data', () => {});
+  watchStartup(backend.stderr,diagnostics);
   createInterface({input:backend.stdout}).on('line', line => {
     try {
       backendRpc.receive(JSON.parse(line));
@@ -183,12 +192,36 @@ app.whenReady().then(async () => {
       }
       throw Error('Unknown linking operation.');
     }
-    if(action==='snapshot')return combinedSnapshot();
+    if(action==='buddy-groups') {
+      const sender=new URL(event.senderFrame.url);
+      const manager=sender.pathname==='/controls.html' && sender.searchParams.get('kind')==='groups';
+      if((sender.pathname!=='/' && !manager) || (sender.searchParams.get('mailbox') || 'buddies')!=='buddies')throw Error('Groups require the buddy list window');
+      const groups=require('./buddy-groups.cjs'),file=path.join(dataRoot,'run','desktop-buddy-groups.json');
+      let value=args.value;
+      if(args.operation!==undefined){
+        if(!manager)throw Error('Group editing requires its settings window');
+        value=groups.read(file);
+        if(args.operation==='create')value.groups.push({id:require('node:crypto').randomUUID(),name:args.name,collapsed:false});
+        else if(args.operation==='rename'){const group=value.groups.find(g=>g.id===args.id);if(!group)throw Error('Group no longer exists');group.name=args.name;}
+        else if(args.operation==='delete'){value.groups=value.groups.filter(g=>g.id!==args.id);value.members=Object.fromEntries(Object.entries(value.members).filter(([,id])=>id!==args.id));}
+        else throw Error('Unknown group operation');
+      }
+      if(value===undefined)return groups.read(file);
+      const saved=groups.write(file,value);
+      const buddyWindow=windows.get('buddies');if(buddyWindow && !buddyWindow.isDestroyed())buddyWindow.webContents.send('iam:groups',saved);
+      return saved;
+    }
+    if(action==='snapshot')return updateFeed.snapshot();
     if(isRemote(args.mailbox)) {
       const sender=new URL(event.senderFrame.url);
       if(sender.pathname!=='/' || (sender.searchParams.get('mailbox')!==args.mailbox && action!=='window'))throw Error('Remote conversation window mismatch.');
       if(action==='window') {remoteDesktop.find(args.mailbox);windowFor(args.mailbox);return true;}
-      if(action==='history')return remoteDesktop.history(args.mailbox);
+      if(action==='history') {
+        const rows=await remoteDesktop.history(args.mailbox);
+        const before=args.before;
+        return rows.filter(row=>!before || row.created<before[0] || (row.created===before[0] && row.id<before[1]))
+          .sort((a,b)=>a.created-b.created || (a.id<b.id?-1:a.id>b.id?1:0)).slice(-(args.limit || 200));
+      }
       if(action==='mark-read')return remoteDesktop.markRead(args.mailbox,args.event_ids);
       if(action==='send') {if(screenLocked)throw Error('Unlock this computer before sending.');return remoteDesktop.send(args.mailbox,args);}
       if(['open','ensure-session','session-readiness'].includes(action)){await remoteDesktop.prepare();remoteDesktop.find(args.mailbox);return {state:action==='open'?'attached':'bound'};}
@@ -304,7 +337,7 @@ app.whenReady().then(async () => {
       const sender = new URL(event.senderFrame.url);
       const mailbox = sender.searchParams.get('mailbox');
       if (!mailbox || args.mailbox !== mailbox || (mailbox === 'buddies' &&
-          !(action === 'pairing-review' || action === 'control-window' && ['pairing','friends'].includes(args.kind)))) throw new Error('Control mailbox mismatch');
+          !(action === 'pairing-review' || action === 'control-window' && ['pairing','friends','groups'].includes(args.kind)))) throw new Error('Control mailbox mismatch');
       if (action === 'control-window') {
         if (!controlKinds.has(args.kind)) throw new Error('Unknown control dialog');
         controlWindow(mailbox, args.kind, windows.get(mailbox)); return true;
@@ -343,7 +376,7 @@ app.whenReady().then(async () => {
       }
     }
     if (action === 'theme') {
-      const file = path.join(root, 'run', 'desktop-theme.json');
+      const file = path.join(dataRoot, 'run', 'desktop-theme.json');
       if (args.value !== undefined) {
         if (!['dark', 'light'].includes(args.value)) throw new Error('Invalid theme');
         fs.writeFileSync(file, JSON.stringify({value: args.value}));
@@ -369,12 +402,13 @@ app.whenReady().then(async () => {
   } catch { console.error('Could not restore desktop chat windows.'); }
   restoring = false;
   saveWindows();
+  updateFeed.start();
   if (smoke) {
     const win=windows.get('buddies');
     await new Promise(resolve=>win.webContents.once('did-finish-load',resolve));
     const result=await rpc('snapshot');
     await new Promise(resolve=>setTimeout(resolve,1500));
-    fs.writeFileSync(path.join(root,'run','desktop-preview.png'),(await win.webContents.capturePage()).toPNG());
+    fs.writeFileSync(path.join(dataRoot,'run','desktop-preview.png'),(await win.webContents.capturePage()).toPNG());
     const unauthorized = await fetch(origin);
     if (unauthorized.status !== 403) throw new Error('Unauthenticated desktop HTTP access was not rejected');
     console.log(JSON.stringify({smoke:true,buddies:result.buddies.length,loopback:server.address().address}));
@@ -382,5 +416,5 @@ app.whenReady().then(async () => {
   }
 }).catch(error=>{ diagnostics.event('startup-failed',{errorType:error.name}); console.error('Messenger startup failed; see local diagnostics.'); app.exit(1); });
 app.on('window-all-closed',()=>{});
-app.on('before-quit',()=>{stopping=true; backendRpc?.stop(); saveWindows(); server?.close();});
-app.on('will-quit',()=>{backend?.kill(); tray?.destroy();try{const file=path.join(root,'run','desktop-control.json');if(JSON.parse(fs.readFileSync(file,'utf8')).pid===process.pid)fs.unlinkSync(file);}catch{}});
+app.on('before-quit',()=>{stopping=true; backendRpc?.stop(); saveWindows(); updateFeed.stop(); server?.close();});
+app.on('will-quit',()=>{backend?.kill(); tray?.destroy();try{const file=path.join(dataRoot,'run','desktop-control.json');if(JSON.parse(fs.readFileSync(file,'utf8')).pid===process.pid)fs.unlinkSync(file);}catch{}});

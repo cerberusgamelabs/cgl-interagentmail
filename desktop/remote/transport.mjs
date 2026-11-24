@@ -118,7 +118,8 @@ export class MessengerTransport {
       {installation_id:installationId,challenge},session.token);
     if(generation!==this.generation)throw new Error('Sign-in superseded');
     if(!['awaiting_local_confirmation','approved'].includes(value.state) ||
-       !Number.isSafeInteger(value.expires_at) || value.expires_at*1000<=Date.now() ||
+       (!(value.state==='approved' && value.expires_at===null) &&
+         (!Number.isSafeInteger(value.expires_at) || value.expires_at*1000<=Date.now())) ||
        (value.state==='approved' && (typeof value.grant_id!=='string' || !/^[A-Za-z0-9_-]{32,128}$/.test(value.grant_id))))
       throw new Error('Invalid pairing status');
     if(value.conversations!==undefined && (!Array.isArray(value.conversations) || value.conversations.length>1024 ||

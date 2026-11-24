@@ -29,6 +29,14 @@ test('owner account is pinned and secrets never leave protected storage',async t
 test('plaintext credential storage is rejected',async t=>{
   const f=fixture(t);f.safeStorage.isEncryptionAvailable=()=>false;await assert.rejects(f.client.login('owner','password'),/Protected/);
 });
+
+test('until-revoked grants remain usable and absent expiry is not permanent',async t=>{
+  const f=await paired(t),link=f.client.state.links[0];
+  link.expiresAt=null;await f.client.update();
+  assert.equal(f.client.find(remoteId('mini','Agent')).link,link);
+  delete link.expiresAt;
+  assert.throws(()=>f.client.find(remoteId('mini','Agent')),/expired/);
+});
 test('only configured peers can pair and approved remote roster has collision-safe ids',async t=>{
   const f=await paired(t);await assert.rejects(f.client.pair('foreign'));
   assert.equal(f.client.buddies[0].mailbox,remoteId('mini','Agent'));

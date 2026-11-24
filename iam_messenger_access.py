@@ -34,7 +34,7 @@ class OwnerGrant:
     device_id: str
     installation_id: str
     conversation_ids: frozenset[str]
-    expires_at: int
+    expires_at: int | None
     history_from: int
     revoked: bool = False
     owner_key: str | None = None
@@ -56,7 +56,7 @@ def authorize(*, enabled: bool, principal: Principal | None,
         raise AccessDenied('Invalid identity')
     if actual != expected or not installation_id or installation_id != grant.installation_id:
         raise AccessDenied('Pairing does not match this identity and installation')
-    if grant.revoked or now >= grant.expires_at:
+    if grant.revoked or (grant.expires_at is None and not grant.owner_key) or (grant.expires_at is not None and now >= grant.expires_at):
         raise AccessDenied('Pairing expired or revoked')
     if not conversation_id or conversation_id not in grant.conversation_ids:
         raise AccessDenied('Conversation not granted')

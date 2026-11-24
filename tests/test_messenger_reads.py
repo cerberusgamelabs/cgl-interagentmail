@@ -10,6 +10,16 @@ from iam_messenger_access import AccessDenied
 
 
 class ReadTests(HistoryTests):
+    def test_permanent_grant_push_is_a_renewable_bounded_lease(self):
+        with self.store.connection() as db:
+            db.execute('UPDATE pairing_grants SET expires=0 WHERE id=?',(self.frame['grant_id'],))
+        push={'id':'00000000-0000-4000-8000-000000000001','token':'a'*50}
+        events_request(self.event_frame([],push),self.config,self.store,self.path,now=121)
+        self.assertEqual(push_states(self.desktop,self.store,self.config,2000)[0]['expires_at'],2300)
+        self.assertEqual(push_states(self.desktop,self.store,self.config,2300)[0]['expires_at'],2600)
+        self.store.revoke(self.frame['grant_id'])
+        self.assertEqual(push_states(self.desktop,self.store,self.config,2301)[0]['unread'],0)
+
     def setUp(self):
         super().setUp()
         self.desktop=DesktopStore(self.path)

@@ -7,7 +7,7 @@ import {uploadImage,downloadImage} from './images.mjs';
 import {imagePreviews} from './image-grid.mjs';
 const previews=imagePreviews({document});
 import {fitDraft} from './composer.mjs';
-import {parseInvitation,enrollConversations,mergeDesktopRoster} from './pairing.mjs';
+import {parseInvitation,enrollConversations,mergeDesktopRoster,grantValid,notificationExpiry} from './pairing.mjs';
 import {LiveConversation} from './live.mjs';
 import {downloadText} from './full-text.mjs';
 import {downloadDocument} from './documents.mjs';
@@ -107,7 +107,7 @@ function updateLive(){
 }
 function rosterGroups(){
   const groups=new Map();
-  for(const buddy of state?.buddies || [])if(buddy.grantId && buddy.grantExpires*1000>Date.now()){
+  for(const buddy of state?.buddies || [])if(grantValid(buddy)){
     if(!groups.has(buddy.installation))groups.set(buddy.installation,[]);
     groups.get(buddy.installation).push({conversation:buddy.conversation,grant:buddy.grantId});
   }
@@ -117,7 +117,7 @@ async function refreshDesktopLinks(){
   const current=transport,session=current?.session;
   for(const link of state?.desktopLinks || []){
     if(!session || current!==transport || current.session!==session || document.hidden || screen!=='home')return;
-    if(link.grantExpires*1000<=Date.now())continue;
+    if(!grantValid(link))continue;
     let result;
     try{result=await current.syncEvents(link.installation,'@desktop',link.grantId,[],nativeSigner(native));}
     catch{
@@ -227,18 +227,18 @@ let notificationSession=null,notificationCursor=0;
 function drawNotificationStatus(){
   if(notificationSession!==transport?.session){notificationFailures.clear();notificationSession=transport?.session;}
   const opted=(state?.buddies || []).filter(b=>b.push);
-  const expired=opted.some(b=>!b.grantId || !(b.grantExpires*1000>Date.now()));
+  const expired=opted.some(b=>!grantValid(b));
   const failed=opted.some(b=>notificationFailures.has(buddyKey(b)));
   $('notificationNotice').hidden=!transport?.session || !(expired || failed || friendNotificationFailed);
   $('notificationNotice').textContent=expired?
-    'Some notification permissions have expired. Renew the affected conversation pairing to restore alerts.':
+    'Some saved pairings need approval. If a legacy desktop-wide pairing expired, use Connect desktop once to approve access until revoked. History access and alerts use that pairing.':
     friendNotificationFailed?'Friend notification registration could not be refreshed. Friend alerts may be unavailable; Messenger will retry while open.':
     'Notification registration could not be refreshed. Background alerts may be unavailable. Check Android notification settings and your connection; Messenger will retry while open.';
 }
 async function renewHomeNotifications(){
   drawNotificationStatus();
   const current=transport,session=current?.session;
-  const buddies=(state?.buddies || []).filter(b=>b.push && b.grantId && b.grantExpires*1000>Date.now());
+  const buddies=(state?.buddies || []).filter(b=>b.push && grantValid(b));
   if(document.hidden || !session || !buddies.length)return;
   const buddy={...buddies[notificationCursor++ % buddies.length]},id=buddyKey(buddy);
   const valid=()=>transport===current && current.session===session && !document.hidden &&
@@ -247,7 +247,7 @@ async function renewHomeNotifications(){
     const {token}=await native.refreshNotificationToken();
     if(!valid())return;
     if(typeof token!=='string' || !token)throw Error('Notification token unavailable');
-    await native.registerNotificationScope({id:buddy.push.id,expires:Math.min(buddy.grantExpires,Math.floor(session.expiresAt/1000))});
+    await native.registerNotificationScope({id:buddy.push.id,expires:notificationExpiry(buddy,session)});
     if(!valid())return;
     await current.syncEvents(buddy.installation,buddy.conversation,buddy.grantId,[],async(bytes,intent)=>{
       if(!valid())throw Error('Notification scope changed');
@@ -264,7 +264,7 @@ async function syncUnread(buddy,ids=[]) {
     return nativeSigner(native)(bytes,intent);
   };
   const push=buddy.push && pushToken?{id:buddy.push.id,token:pushToken}:null;
-  if(push)await native.registerNotificationScope({id:push.id,expires:Math.min(buddy.grantExpires,Math.floor(currentTransport.session.expiresAt/1000))});
+  if(push)await native.registerNotificationScope({id:push.id,expires:notificationExpiry(buddy,currentTransport.session)});
   const result=await currentTransport.syncEvents(buddy.installation,buddy.conversation,buddy.grantId,ids,signer,push);
   if(transport!==currentTransport || !transport.session)return false;
   profiles.set(buddyKey(buddy),publicProfile(result.profile));
@@ -286,7 +286,7 @@ $('enableNotifications').onclick=()=>run(async()=>{
   const {token}=await native.enableNotifications();
   pushToken=token;
   state.push={id:state.push?.id || crypto.randomUUID(),token};await save();
-  await native.registerNotificationScope({id:state.push.id,expires:Math.min(state.grantExpires,Math.floor(transport.session.expiresAt/1000))});
+  await native.registerNotificationScope({id:state.push.id,expires:notificationExpiry(state,transport.session)});
   await transport.syncEvents(state.installation,state.conversation,state.grantId,[],nativeSigner(native),state.push);
   message('Notification registration accepted. Alerts are generic; desktop reads clear them after synchronization.');
 });
@@ -307,7 +307,7 @@ async function checkUnreadCounts() {
   if(screen==='home'){
     unreadBusy=true;try{await renewHomeNotifications();await refreshDesktopLinks();await refreshFriendSummary();if(!live?.connected){const groups=rosterGroups();if(groups.length)await refreshRoster([groups[homeRosterCursor++ % groups.length]]);}}catch{/* Subscription retries independently. */}finally{unreadBusy=false;}return;
   }
-  const buddies=(state?.buddies || []).filter(b=>b.grantId && b.grantExpires*1000>Date.now());
+  const buddies=(state?.buddies || []).filter(b=>grantValid(b));
   if(!buddies.length)return;
   unreadBusy=true;
   const buddy=buddies[unreadCursor++ % buddies.length];
@@ -327,7 +327,7 @@ function drawBuddies(){
     if(filter && !`${buddyName(buddy)} ${buddy.conversation} ${buddy.installation}`.toLocaleLowerCase().includes(filter))continue;
     shown++;
     const button=document.createElement('button');
-    const expired=buddy.grantExpires && buddy.grantExpires*1000<=Date.now();
+    const expired=buddy.grantId && !grantValid(buddy);
     button.className='buddy buddy-owner';
     const picture=avatars.get(buddyKey(buddy)),profile=profiles.get(buddyKey(buddy));
     const avatar=document.createElement(picture && picture.sha256===profile?.avatar?.sha256?'img':'span');avatar.className='buddy-avatar';

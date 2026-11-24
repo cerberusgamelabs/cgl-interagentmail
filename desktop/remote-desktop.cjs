@@ -95,7 +95,7 @@ class RemoteDesktop {
     const buddy=this.buddies.find(b=>b.mailbox===mailbox);
     if(!buddy)throw Error('Remote conversation is unavailable or not approved.');
     const link=this.state.links.find(l=>l.node===buddy.node && l.grantId===buddy.grantId);
-    if(!link || link.expiresAt*1000<=this.now())throw Error('Remote conversation approval expired.');
+    if(!link || !(link.expiresAt===null || (Number.isSafeInteger(link.expiresAt) && link.expiresAt*1000>this.now())))throw Error('Remote conversation approval expired.');
     return {buddy,link};
   }
   refresh() {
@@ -108,7 +108,7 @@ class RemoteDesktop {
     await this.prepare();if(!this.client.session)return;
     const session=this.client.session,scope=this.scope;
     const buddies=[];
-    for(const link of this.state.links.filter(l=>l.grantId && l.expiresAt*1000>this.now())) {
+    for(const link of this.state.links.filter(l=>l.grantId && (l.expiresAt===null || (Number.isSafeInteger(l.expiresAt) && l.expiresAt*1000>this.now())))) {
       const result=await this.client.syncEvents(link.node,'@desktop',link.grantId,[],this.signer(link,'@desktop'));
       if(this.client.session!==session || this.scope!==scope)throw Error('Account changed; remote roster discarded.');
       for(const item of result.desktopRoster || [])buddies.push({mailbox:remoteId(link.node,item.conversation),

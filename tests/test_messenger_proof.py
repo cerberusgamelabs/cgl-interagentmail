@@ -41,6 +41,30 @@ class ProofTests(unittest.TestCase):
                                     ec.ECDSA(hashes.SHA256()))).decode('ascii')
         return dict(nonce=proof['nonce'], signature=signature)
 
+    def test_owner_trust_persists_but_proofs_expire_and_revocation_wins(self):
+        now = 100 + 50 * 365 * 86400
+        reopened = Pairings(self.path)
+        grant = reopened.get(self.args['grant_id'], self.person, now=now)
+        self.assertIsNone(grant.expires_at)
+        self.assertEqual(len(reopened.local_grants('conversation', now=now)), 1)
+        proofs = OwnerProofs(reopened)
+        proof = proofs.issue(**self.args, now=now)
+        self.assertEqual(proof['expires_at'], now + 60)
+        signature = base64.b64encode(self.key.sign(base64.b64decode(proof['payload']), ec.ECDSA(hashes.SHA256()))).decode('ascii')
+        with self.assertRaises(AccessDenied):
+            proofs.consume(**self.args, nonce=proof['nonce'], signature=signature, now=now+60)
+        reopened.revoke(self.args['grant_id'])
+        with self.assertRaises(AccessDenied):
+            proofs.consume(**self.args, nonce=proof['nonce'], signature=signature, now=now+1)
+        self.assertEqual(reopened.local_grants(None, now=now+1), [])
+
+    def test_legacy_timed_grant_is_not_silently_promoted(self):
+        challenge = self.store.request(self.person, 'node', now=100, owner_key=self.encoded)
+        grant = self.store.approve(challenge,self.person,'node',{'conversation'},now=101,
+            expires_at=200,history_from=0,expected_owner_key=self.encoded)
+        with self.assertRaises(AccessDenied):
+            Pairings(self.path).get(grant,self.person,now=201)
+
     def test_valid_and_replay_after_reopen(self):
         signed = self.signed()
         result = self.proofs.consume(**self.args, **signed, now=104)

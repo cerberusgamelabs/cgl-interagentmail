@@ -7,7 +7,8 @@ test('desktop bridge explicitly enables UTF-8 and round-trips newer emojis', () 
   const root = path.join(__dirname, '../..');
   const main = fs.readFileSync(path.join(root, 'desktop/main.cjs'), 'utf8');
   const backend = fs.readFileSync(path.join(root, 'iam_desktop.py'), 'utf8');
-  assert.match(main, /\['-X','utf8','-u','-m','iam_desktop'\]/);
+  assert.match(main, /\['-X','utf8','-u','-c',bootstrap\]/);
+  assert.match(require('../backend-startup.cjs').bootstrap, /runpy.run_module\('iam_desktop', run_name='__main__'\)/);
   assert.match(backend, /sys.stdin.reconfigure\(encoding='utf-8', errors='strict'\)/);
   const python = process.env.IAM_DESKTOP_PYTHON || (fs.existsSync(path.join(root, '.venv/Scripts/python.exe')) ? path.join(root, '.venv/Scripts/python.exe') : 'python3');
   const sample = '🥹🫠🫶 — café';

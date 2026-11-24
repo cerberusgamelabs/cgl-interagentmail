@@ -3,12 +3,14 @@ const path=require('node:path');
 const {randomUUID}=require('node:crypto');
 
 // Deliberately omit messages, stacks, URLs, argv, mailbox names and IPC payloads.
-const numbers=new Set(['exitCode','processId','webContentsId']);
+const numbers=new Set(['exitCode','processId','webContentsId','lineNumber']);
 const enums={reason:new Set(['clean-exit','abnormal-exit','killed','crashed','oom','launch-failed','integrity-failure']),
   type:new Set(['Browser','GPU','Utility','Zygote','Sandbox helper','Pepper Plugin','Pepper Plugin Broker','renderer']),
   signal:new Set(['SIGTERM','SIGKILL','SIGABRT','SIGSEGV','SIGINT']),
   errorType:new Set(['Error','TypeError','RangeError','SyntaxError','ReferenceError','URIError','EvalError']),
-  origin:new Set(['uncaughtException','unhandledRejection'])};
+  origin:new Set(['uncaughtException','unhandledRejection']),
+  pythonError:new Set(['ImportError','ModuleNotFoundError','OSError','PermissionError','FileNotFoundError','RuntimeError','ValueError','TypeError','AttributeError','UnicodeError','UnicodeDecodeError','SyntaxError','OperationalError','OtherError']),
+  pythonFile:new Set(['iam_desktop.py','iam_orchestrator.py','iam_service.py','interagentmail.py','iam_desktop_controls.py','iam_desktop_onboarding.py','iam_messenger_friend_delivery.py','unknown'])};
 function project(details={}){
   const result={};
   for(const [key,value] of Object.entries(details)){

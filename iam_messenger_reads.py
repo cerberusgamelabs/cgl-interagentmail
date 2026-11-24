@@ -10,6 +10,8 @@ import time
 
 
 def initialize(db):
+    db.execute('CREATE INDEX IF NOT EXISTS requests_mailbox_created ON requests(mailbox,created,id)')
+    db.execute('CREATE INDEX IF NOT EXISTS notices_mailbox_created ON notices(mailbox,created,id)')
     db.execute('CREATE TABLE IF NOT EXISTS read_events (event_id TEXT PRIMARY KEY)')
     db.execute("INSERT OR IGNORE INTO read_events SELECT id || ':reply' FROM seen")
     db.execute('''CREATE TABLE IF NOT EXISTS push_subscriptions (
@@ -56,7 +58,8 @@ def push_states(desktop, pairings, config, now):
             try:
                 grant=OwnerProofs(pairings).scope(row['grant_id'],principal,config['node_id'],row['mailbox'],'events',now)
                 ids=unread(db,row['mailbox'],max(grant.history_from,row['notify_from']))
-                expires=grant.expires_at
+                # Push delivery is a renewable lease, not the device's trust lifetime.
+                expires=grant.expires_at if grant.expires_at is not None else now+300
             except AccessDenied:
                 ids=[]; expires=now+60
             fingerprint=hashlib.sha256(json.dumps(ids).encode()).hexdigest()
@@ -97,8 +100,14 @@ def incoming(db, mailbox, history_from=0):
 
 
 def unread(db, mailbox, history_from=0):
-    read = {r[0] for r in db.execute('SELECT event_id FROM read_events')}
-    return [r[0] for r in incoming(db,mailbox,history_from) if r[0] not in read]
+    return [r[0] for r in db.execute('''SELECT event_id FROM (
+        SELECT r.id || ':reply' event_id, coalesce(t.created,r.created) created
+        FROM requests r LEFT JOIN reply_times t ON t.request_id=r.id
+        WHERE r.mailbox=? AND r.reply IS NOT NULL
+        UNION ALL SELECT id || ':notice', created FROM notices WHERE mailbox=? AND kind='agent'
+        ) e WHERE created>=? AND NOT EXISTS
+        (SELECT 1 FROM read_events v WHERE v.event_id=e.event_id)
+        ORDER BY created,event_id''', (mailbox,mailbox,history_from))]
 
 
 def mark(db, mailbox, ids, history_from=0):

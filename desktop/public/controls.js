@@ -28,6 +28,19 @@ async function prepare(action, args = {}) {
 async function load() {
   $('notice').textContent='Loading…'; $('content').replaceChildren();
   try {
+    if(kind==='groups') {
+      $('title').textContent='Buddy-list groups';$('scope').textContent='Personal organization on this computer';
+      const current=await window.iam.call('buddy-groups',{});
+      text('Deleting a group moves its members to Ungrouped. Conversations and permissions are unchanged.');
+      const choices=select('Existing group',current.groups.map(g=>[g.id,g.name]));
+      const name=document.createElement('input');name.maxLength=80;name.placeholder='Group name';name.setAttribute('aria-label','Group name');$('content').append(name);
+      choices.onchange=()=>{name.value=current.groups.find(g=>g.id===choices.value)?.name || '';};
+      for(const [operation,label] of [['create','Create'],['rename','Rename'],['delete','Delete group']]){
+        const b=button(label,async()=>{await window.iam.call('buddy-groups',{operation,id:choices.value,name:name.value});await load();});
+        if(operation!=='create')b.disabled=!current.groups.length;
+      }
+      $('notice').textContent='';return;
+    }
     if(kind==='more') {
       $('scope').textContent=mailbox;
       for(const item of ['model','plan','permissions']) button(labels[item],()=>window.iam.call('control-window',{mailbox,kind:item}));
@@ -70,7 +83,7 @@ async function load() {
         const receipt=await window.iam.call('pairing-review',{mailbox,operation:'prepare',challenge:input.value.trim(),include_history:history.value==='existing',owner_access:authority.value==='owner'});
         $('content').replaceChildren();
         text(receipt.owner_access?'Compare the key fingerprint with your phone. This trusts that specific device as you, using the existing session permissions. A compromised phone could act with your authority.':'Conversation-only legacy grant; no owner authority.');
-        show({home:receipt.identity.home_server,account:receipt.identity.account_id,device:receipt.identity.device_id,installation:receipt.installation,conversation:receipt.conversation,ownerAuthority:receipt.owner_access,keyFingerprint:receipt.key_fingerprint,existingHistory:receipt.include_history,expires:new Date(receipt.expires_at*1000).toLocaleString()});
+        show({home:receipt.identity.home_server,account:receipt.identity.account_id,device:receipt.identity.device_id,installation:receipt.installation,conversation:receipt.conversation,ownerAuthority:receipt.owner_access,keyFingerprint:receipt.key_fingerprint,existingHistory:receipt.include_history,expires:receipt.expires_at===null?'Until you revoke this device':new Date(receipt.expires_at*1000).toLocaleString()});
         const confirm=button('Approve this device',async()=>{
           confirm.disabled=true;
           try{const result=await window.iam.call('pairing-review',{mailbox,operation:'confirm',ticket:receipt.ticket});$('content').replaceChildren();text(result.note);}
@@ -149,7 +162,7 @@ async function accountPairing() {
       $('content').replaceChildren();
       text(receipt.desktop_scope?'Approval covers ALL current and future agents on this desktop.':'Legacy limited approval: only the listed conversations.');
       text('Compare this fingerprint with your phone. This device can act as you with the existing agent session permissions. Approve only your own phone.');
-      show({account:receipt.identity.account_id,device:receipt.identity.device_id,keyFingerprint:receipt.key_fingerprint,conversations:receipt.conversations,existingHistory:receipt.include_history,expires:new Date(receipt.expires_at*1000).toLocaleString()});
+      show({account:receipt.identity.account_id,device:receipt.identity.device_id,keyFingerprint:receipt.key_fingerprint,conversations:receipt.conversations,existingHistory:receipt.include_history,expires:receipt.expires_at===null?'Until you revoke this device':new Date(receipt.expires_at*1000).toLocaleString()});
       button('Approve this account and phone',async()=>{
         const result=await pairing('confirm-invite',{ticket:receipt.ticket});$('content').replaceChildren();text(result.note);
       });

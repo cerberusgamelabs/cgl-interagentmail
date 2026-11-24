@@ -17,7 +17,7 @@ test('cancelling first-session confirmation preserves draft and does not send',a
   const button={disabled:false}, attachButton={disabled:false}, calls=[];
   const context={mailbox:'New',sending:false,loadingImages:false,stagedImages:[],lastAttempt:null,
     crypto:{randomUUID:()=> 'request'},attachButton,showAttachments:()=>{},refresh:async()=>{},
-    $:id=>elements[id], call:async(action)=>{calls.push(action);return {state:'cancelled'};}};
+    $:id=>elements[id], timedCall:async(action)=>{calls.push(action);return {state:'cancelled'};}};
   vm.createContext(context);
   vm.runInContext(ui.slice(ui.indexOf("$('compose').onsubmit ="),ui.indexOf("if (mailbox !== 'buddies') {",ui.indexOf("$('compose').onsubmit ="))),context);
   await elements.compose.onsubmit({preventDefault(){}});
@@ -25,4 +25,18 @@ test('cancelling first-session confirmation preserves draft and does not send',a
   assert.equal(elements.body.value,'Hello');
   assert.equal(button.disabled,false);
   assert.equal(attachButton.disabled,false);
+});
+
+test('accepted send releases controls without waiting for history refresh',async()=>{
+  const button={disabled:false},attachButton={disabled:false};
+  const elements={compose:{querySelector:()=>button},body:{value:'Hello'},notice:{}};
+  let refreshed=false;
+  const context={mailbox:'One',sending:false,loadingImages:false,stagedImages:[],lastAttempt:null,
+    crypto:{randomUUID:()=> 'request'},attachButton,showAttachments:()=>{},
+    refresh:()=>{refreshed=true;return new Promise(()=>{});},
+    $:id=>elements[id],timedCall:async action=>action==='ensure-session'?{state:'bound'}:{accepted:true}};
+  vm.createContext(context);
+  vm.runInContext(ui.slice(ui.indexOf("$('compose').onsubmit ="),ui.indexOf("if (mailbox !== 'buddies') {",ui.indexOf("$('compose').onsubmit ="))),context);
+  await elements.compose.onsubmit({preventDefault(){}});
+  assert.equal(refreshed,true);assert.equal(button.disabled,false);assert.equal(elements.body.value,'');
 });

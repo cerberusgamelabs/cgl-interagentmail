@@ -18,6 +18,12 @@ test('status returns only scoped grant fields and rejects malformed approval',as
   const transport=new MessengerTransport('https://example.test',{fetchImpl:async()=>({ok:true,json:async()=>value})});
   transport.session={token:'a'.repeat(43),expiresAt:Date.now()+60000};
   assert.deepEqual(Object.keys(await transport.pairingStatus('node','b'.repeat(43))).sort(),['expiresAt','grantId','state']);
+  value={...value,expires_at:null};
+  assert.equal((await transport.pairingStatus('node','b'.repeat(43))).expiresAt,null);
+  value={...value,state:'awaiting_local_confirmation'};
+  await assert.rejects(transport.pairingStatus('node','b'.repeat(43)),/Invalid pairing status/);
+  value={...value,state:'approved',expires_at:undefined};
+  await assert.rejects(transport.pairingStatus('node','b'.repeat(43)),/Invalid pairing status/);
   value={...value,grant_id:[]};
   await assert.rejects(transport.pairingStatus('node','b'.repeat(43)),/Invalid pairing status/);
 });

@@ -22,11 +22,11 @@ class ForegroundStreams:
         # A new foreground connection replaces the same phone's previous view.
         self.leases={key:value for key,value in self.leases.items() if value['principal']!=principal}
         if len(self.leases)>=64:raise AccessDenied('Stream limit')
-        expires=min(now+300,grant.expires_at)
+        expires=min(now+300,grant.expires_at) if grant.expires_at is not None else now+300
         if roster:
             for scope in roster:
                 other=OwnerProofs(pairings).scope(scope['grant'],principal,installation,scope['conversation'],'events',now)
-                expires=min(expires,other.expires_at)
+                if other.expires_at is not None: expires=min(expires,other.expires_at)
         self.leases[stream_id]=dict(principal=principal,installation=installation,conversation=conversation,roster=roster,
             grant_id=grant_id,expires=expires,fingerprint=None,revision=0)
         return dict(id=stream_id,expires_at=expires)

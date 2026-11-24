@@ -46,7 +46,7 @@ class OwnerProofs:
     def issue(self, grant_id, principal, installation, conversation, operation, content, *, now):
         grant = self.scope(grant_id, principal, installation, conversation, operation, now)
         nonce = secrets.token_urlsafe(32)
-        expires = min(now + 60, grant.expires_at)
+        expires = min(now + 60, grant.expires_at) if grant.expires_at is not None else now + 60
         payload = self.payload(nonce, grant_id, principal, installation, conversation, operation, content, expires)
         with self.pairings.connection() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -70,7 +70,8 @@ class OwnerProofs:
                 raise AccessDenied('Device proof expired or used')
             # Recheck revocation under the same write lock used by revoke.
             grant_row = db.execute('SELECT * FROM pairing_grants WHERE id=?', (grant_id,)).fetchone()
-            if grant_row is None or grant_row['revoked'] or grant_row['expires'] <= now:
+            if (grant_row is None or grant_row['revoked'] or not grant_row['owner_key']
+                    or (grant_row['expires'] != 0 and grant_row['expires'] <= now)):
                 raise AccessDenied('Pairing unavailable')
             payload = self.payload(nonce, grant_id, principal, installation, conversation, operation, content, row['expires'])
             if payload != row['payload']:

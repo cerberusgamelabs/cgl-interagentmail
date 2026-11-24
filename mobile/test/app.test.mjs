@@ -6,7 +6,7 @@ import {messageBytes,retryDelay,mergeEvents,confirmedPending,recoveryDue,pending
 import {buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfterLogin} from '../buddies.mjs';
 import {fitDraft} from '../composer.mjs';
 import {imagePreviews} from '../image-grid.mjs';
-import {parseInvitation,enrollConversations,mergeDesktopRoster} from '../pairing.mjs';
+import {parseInvitation,enrollConversations,mergeDesktopRoster,grantValid,notificationExpiry} from '../pairing.mjs';
 import {packState,unpackState} from '../protected-state.mjs';
 import {prepareAttachment,addAttachment,uploadAttachments,manifest} from '../uploads.mjs';
 import {publicProfile,downloadAvatar} from '../profiles.mjs';
@@ -20,7 +20,7 @@ async function harness({pending=null,sendError=false,failSave=0,lookup={found:tr
   const elements=new Map(),timers=new Map(),intervals=new Map(),listeners={},writes=[],calls=[],queries=[];
   function element(){return {value:'',textContent:'',dataset:{},scrollTop:0,scrollHeight:600,clientHeight:200,children:[],addEventListener(name,fn){this[name]=fn;},append(...x){this.children.push(...x);},replaceChildren(...x){this.children=x.flatMap(v=>v.fragment?v.children:[v]);},scrollIntoView(){}};}
   const get=id=>{if(!elements.has(id))elements.set(id,element());return elements.get(id);};
-  const saved={origin:'https://example.test',installation:'node',conversation:'friend',grantId:'grant',keyFingerprint:'key',draft:'saved draft',pending,
+  const saved={origin:'https://example.test',installation:'node',conversation:'friend',grantId:'grant',grantExpires:null,keyFingerprint:'key',draft:'saved draft',pending,
     session:{accountId:'owner',deviceId:'phone',expiresAt:Date.now()+600000}};
   let saveCount=0;
   const native={setConversationBack:async()=>{},pickPhoto:async()=>({data:'/9j/AA==',sha256:'a'.repeat(64)}),getKey:async()=>({fingerprint:'key'}),loadState:async()=>({value:JSON.stringify(restore || saved)}),saveState:async({value})=>{if(++saveCount===failSave)throw Error('storage unavailable');writes.push(JSON.parse(value));},clearState:async()=>writes.push(null)};
@@ -28,7 +28,7 @@ async function harness({pending=null,sendError=false,failSave=0,lookup={found:tr
   class Transport{restoreSession(s){this.session=s;}async requestPairing(){calls.push('pair');return {challenge:'fresh'};}async historyPage(...args){calls.push('read');queries.push(args[4]);return page;}async lookupSend(){calls.push('lookup');if(lookupError)throw Error('unknown');return lookup;}async sendText(...args){calls.push('send');this.lastSent=args;if(sendError)throw Error('offline');return {state:'queued'};}async logout(){this.session=null;}}
   const document={hidden:false,body:{classList:{toggle(){}}},getElementById:get,querySelectorAll:()=>[],createElement:element,createDocumentFragment:()=>({...element(),fragment:true}),documentElement:{scrollHeight:100,style:{setProperty(){}}},addEventListener:(n,f)=>listeners[n]=f};
   const context=vm.createContext({friendNotifications,cachedAvatar,rememberAvatar,registerPlugin:()=>native,Capacitor:{isNativePlatform:()=>true},MessengerTransport:Transport,nativeFetch:()=>{},nativeSigner:()=>{},
-    activeFriendBuddies,imagePreviews,installEdgeBack,publicProfile,downloadAvatar,packState,unpackState,prepareAttachment,addAttachment,uploadAttachments,manifest,parseInvitation,enrollConversations,mergeDesktopRoster,fitDraft,messageBytes,retryDelay,mergeEvents,confirmedPending,recoveryDue,pendingLabel,buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfterLogin,document,window:{innerHeight:100,scrollY:0,scrollTo(x,y){this.scrollY=y;},addEventListener(n,f){listeners[n]=f;}},
+    activeFriendBuddies,imagePreviews,installEdgeBack,publicProfile,downloadAvatar,packState,unpackState,prepareAttachment,addAttachment,uploadAttachments,manifest,parseInvitation,enrollConversations,mergeDesktopRoster,grantValid,notificationExpiry,fitDraft,messageBytes,retryDelay,mergeEvents,confirmedPending,recoveryDue,pendingLabel,buddyKey,buddyName,updateBuddyName,rememberBuddy,selectBuddy,restoreAfterLogin,document,window:{innerHeight:100,scrollY:0,scrollTo(x,y){this.scrollY=y;},addEventListener(n,f){listeners[n]=f;}},
     uploadImage:async image=>{calls.push('upload');if(uploadError)throw Error('upload interrupted');},downloadImage:async()=>{},downloadText:async()=>'<literal full message>',downloadDocument:async()=>({name:'notes.txt',data:'YWJj'}),
     IAMMessageTime:{format:()=> 'Today - 1:00 PM',refresh(){}},IAMReadVisible:{tracker:()=>async()=>{}},setInterval:(fn,ms)=>{intervals.set(ms,fn);return ms;},
     IAMMarkdown:{render(el,text){el.textContent=text;}},TextEncoder,Date,JSON,crypto:{randomUUID:()=> '00000000-0000-4000-8000-000000000000'},confirm:()=>true,
@@ -38,6 +38,20 @@ async function harness({pending=null,sendError=false,failSave=0,lookup={found:tr
   if(!home)vm.runInContext("screen='chat';render();schedule()",context);
   return {get,timers,intervals,listeners,writes,calls,queries,document,context,settle,setPage:p=>page=p,read:()=>vm.runInContext('run(loadHistory)',context)};
 }
+
+test('until-revoked owner pairing renews only the notification lease',async()=>{
+  const h=await harness({home:true});
+  vm.runInContext(`state.buddies=[{installation:'node',conversation:'friend',grantId:'grant',grantExpires:null,push:{id:'scope'}}];
+    native.refreshNotificationToken=async()=>({token:'fresh'});
+    native.registerNotificationScope=async value=>{globalThis.registered=value;};
+    transport.syncEvents=async()=>({});`,h.context);
+  await vm.runInContext('renewHomeNotifications()',h.context);
+  assert.equal(h.get('notificationNotice').hidden,true);
+  assert.equal(vm.runInContext('registered.expires===Math.floor(transport.session.expiresAt/1000)',h.context),true);
+  assert.equal(grantValid({grantId:'grant',grantExpires:null},Date.now()+100*365*86400000),true);
+  assert.equal(grantValid({grantId:'grant'}),false);
+  assert.equal(grantValid({grantId:'grant',grantExpires:0}),false);
+});
 
 test('home refresh renews opted-in notifications with no reads even when live',async()=>{
   const h=await harness({home:true});
@@ -258,7 +272,7 @@ test('Help preserves draft and blocks read acknowledgements while covering histo
 
 test('buddy home refreshes the authorized roster together without fetching messages',async()=>{
   const h=await harness({home:true});
-  vm.runInContext("state.buddies=[{installation:'node',conversation:'friend',grantId:'grant',grantExpires:Date.now()/1000+1000}];transport.syncEvents=async(...args)=>{globalThis.rosterArgs=args;return {roster:[{conversation:'friend',displayName:'Chosen name',unread:2,profile:{status:'Hello'}}]}}",h.context);
+  vm.runInContext("state.buddies=[{installation:'node',conversation:'friend',grantId:'grant',grantExpires:Math.floor(Date.now()/1000)+1000}];transport.syncEvents=async(...args)=>{globalThis.rosterArgs=args;return {roster:[{conversation:'friend',displayName:'Chosen name',unread:2,profile:{status:'Hello'}}]}}",h.context);
   await vm.runInContext('refreshRoster()',h.context);
   assert.equal(vm.runInContext('state.buddies[0].displayName',h.context),'Chosen name');
   assert.equal(vm.runInContext('rosterArgs[7][0].grant',h.context),'grant');

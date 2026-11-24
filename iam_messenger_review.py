@@ -44,7 +44,7 @@ class PairingReview:
         record = dict(challenge=challenge, principal=Principal(**pending['principal']),
                       installation=pending['installation'], conversation_id=conversation_id,
                       history_from=0 if include_history else now, owner_key=pending['owner_key'],
-                      expires_at=now + 7 * 86400, deadline=min(now + 60, pending['expires_at']))
+                      expires_at=None if owner_access else now + 7 * 86400, deadline=min(now + 60, pending['expires_at']))
         self.tickets[ticket] = record
         return dict(ticket=ticket, identity=pending['principal'],
                     installation=record['installation'], conversation=conversation_id,

@@ -4,15 +4,12 @@ const headerPortrait = document.createElement('span'); headerPortrait.id = 'head
 if (mailbox !== 'buddies') document.querySelector('header .logo').replaceWith(headerPortrait);
 const call = (action, args) => window.iam.call(action, args);
 if(mailbox==='buddies') {
-  const computers=document.createElement('button');computers.textContent='Link another computer';
-  computers.onclick=()=>call('remote-window',{}).catch(e=>toastNotice(e.message));
-  $('roster').prepend(computers);
-  const connect=document.createElement('button');connect.textContent='Connect phone';
-  connect.onclick=()=>call('control-window',{mailbox,kind:'pairing'}).catch(e=>toastNotice(e.message));
-  $('roster').prepend(connect);
-  const friends=document.createElement('button');friends.textContent='My friend requests';
-  friends.onclick=()=>call('control-window',{mailbox,kind:'friends'}).catch(e=>toastNotice(e.message));
-  $('roster').prepend(friends);
+  const tools=document.createElement('select');tools.className='buddy-tools';tools.setAttribute('aria-label','Buddy-list tools');
+  for(const [value,label] of [['','Tools…'],['groups','Manage groups'],['pairing','Connect phone'],['friends','My friend requests'],['computers','Link another computer']]){
+    const option=document.createElement('option');option.value=value;option.textContent=label;tools.append(option);
+  }
+  tools.onchange=()=>{const kind=tools.value;tools.value='';if(!kind)return;void (kind==='computers'?call('remote-window',{}):call('control-window',{mailbox,kind})).catch(e=>toastNotice(e.message));};
+  const toolbar=document.createElement('div');toolbar.className='buddy-toolbar';$('search').before(toolbar);toolbar.append($('search'),tools);
 }
 let sessionReconnect;
 // Notices are non-modal overlays: they never resize the conversation or steal focus.
@@ -146,6 +143,32 @@ function renderNotices(notices) {
 let previousApprovals = new Set(), previousReplies = new Set(), previousStates = new Map();
 let previousUnread = new Map(), historySignature = '', refreshing = false, audio;
 let updateHistory;
+const historyPager = IAMHistoryView.pager();
+let loadingOlder = false;
+async function loadOlder() {
+  if (loadingOlder || !updateHistory || !historyPager.more || !historyPager.before) return;
+  loadingOlder = true;
+  try {
+    const page = await call('history', {mailbox, limit:50, before:historyPager.before});
+    updateHistory(historyPager.merge(page, true));
+  } catch (error) { toastNotice(error.message); }
+  finally { loadingOlder = false; }
+}
+let previousHistoryTop = 0;
+$('messages').tabIndex = 0;
+$('messages').addEventListener('scroll', () => {
+  const top = $('messages').scrollTop;
+  if (top < previousHistoryTop && top < 32) void loadOlder();
+  previousHistoryTop = top;
+}, {passive:true});
+$('messages').addEventListener('wheel', event => {
+  if (event.deltaY < 0 && $('messages').scrollTop < 32) void loadOlder();
+}, {passive:true});
+async function timedCall(action, args) {
+  const start = performance.now();
+  try { return await call(action, args); }
+  finally { console.debug('IAM timing', action, Math.round(performance.now()-start), 'ms'); }
+}
 const usageFooter = document.createElement('div');
 const respondingIndicator = document.createElement('div');
 let respondingExpiry;
@@ -220,10 +243,24 @@ async function inspectApproval(id) {
   } catch (error) { $('notice').textContent = error.message; }
 }
 
+let rosterGroups={groups:[],members:{}}, groupsReady=false, groupsSaving=false;
+async function saveGroups(next) {
+  if(!groupsReady || groupsSaving) return;
+  groupsSaving=true;
+  try {rosterGroups=await call('buddy-groups',{value:next});renderRoster();}
+  catch(error){toastNotice(error.message);}
+  finally {groupsSaving=false;}
+}
+if(mailbox==='buddies') {
+  window.iam.onGroups(value=>{rosterGroups=value;groupsReady=true;renderRoster();});
+  call('buddy-groups',{}).then(value=>{rosterGroups=value;groupsReady=true;renderRoster();}).catch(error=>toastNotice(error.message));
+}
+
 function renderRoster() {
   const filter = $('search').value.toLowerCase();
   // Commit only a complete render; an exception must not erase the last good list.
   const fragment = document.createDocumentFragment();
+  const sections=new Map();
   for (const buddy of [...roster].sort((a, b) => a.name.localeCompare(b.name))) {
     if (!`${buddy.name} ${buddy.mailbox}`.toLowerCase().includes(filter)) continue;
     const row = document.createElement('div'); row.className = 'buddy';
@@ -254,7 +291,31 @@ function renderRoster() {
       badge.title = 'Needs your approval'; badge.setAttribute('aria-label', `Review approval for ${buddy.name}`);
       badge.onclick = () => inspectApproval(pending.id); row.append(badge);
     }
-    fragment.append(row);
+    if(typeof groupsReady!=='undefined' && groupsReady){
+      const picker=document.createElement('select');picker.className='buddy-group-picker';picker.setAttribute('aria-label',`Group for ${buddy.name}`);
+      const none=document.createElement('option');none.value='';none.textContent='Ungrouped';picker.append(none);
+      for(const group of rosterGroups.groups){const option=document.createElement('option');option.value=group.id;option.textContent=group.name;picker.append(option);}
+      picker.value=Object.hasOwn(rosterGroups.members,buddy.mailbox)?rosterGroups.members[buddy.mailbox]:'';
+      picker.onchange=()=>{const next=structuredClone(rosterGroups);if(picker.value)Object.defineProperty(next.members,buddy.mailbox,{value:picker.value,enumerable:true,writable:true,configurable:true});else delete next.members[buddy.mailbox];void saveGroups(next);};
+      row.append(picker);
+      const id=picker.value;
+      if(!sections.has(id))sections.set(id,[]);
+      sections.get(id).push({row,buddy});
+    } else fragment.append(row);
+  }
+  if(typeof groupsReady!=='undefined' && groupsReady){
+    for(const group of [...rosterGroups.groups,{id:'',name:'Ungrouped',collapsed:false}]){
+      const entries=sections.get(group.id) || [];
+      if(filter && !entries.length)continue;
+      if(!group.id && !entries.length)continue;
+      const section=document.createElement('details');section.className='buddy-group';section.open=Boolean(filter) || !group.collapsed;
+      const summary=document.createElement('summary');const unread=entries.reduce((n,e)=>n+(Number(e.buddy.unread)||0),0);
+      const pending=entries.some(e=>approvals.some(a=>a.mailbox===e.buddy.mailbox));
+      summary.textContent=`${group.name} (${entries.length})${unread?` · ${unread} unread`:''}${pending?' · Approval needed':''}`;
+      section.append(summary,...entries.map(e=>e.row));
+      if(group.id)section.ontoggle=()=>{if(!section.isConnected || filter || groupsSaving || section.open===!group.collapsed)return;const next=structuredClone(rosterGroups);next.groups.find(g=>g.id===group.id).collapsed=!section.open;void saveGroups(next);};
+      fragment.append(section);
+    }
   }
   const visible = fragment.childNodes.length;
   $('buddies').replaceChildren(fragment);
@@ -268,11 +329,15 @@ function creditLabel(credits) {
   return Number.isFinite(balance) && balance >= 0 ? `Credits: ${balance.toFixed(2)}` : 'Credits: unavailable';
 }
 
+let lastHistoryRevision, pendingSnapshot;
 async function refresh() {
+  const incomingSnapshot=arguments[0];
+  if (incomingSnapshot) pendingSnapshot=incomingSnapshot;
   if (refreshing) return; refreshing = true;
   const previousRoster = roster, previousApprovalList = approvals;
   try {
-    const snapshot = await call('snapshot'); roster = snapshot.buddies; approvals = snapshot.approvals;
+    const snapshot = pendingSnapshot || await call('snapshot'); pendingSnapshot=null;
+    roster = snapshot.buddies; approvals = snapshot.approvals;
     const weekly = snapshot.weekly;
     usageFooter.textContent = (weekly ? `Account weekly: ${weekly.remainingPercent}% left` : 'Account weekly: unavailable') + ' ● ' + creditLabel(snapshot.credits);
     usageFooter.title = weekly ? `Checked ${new Date(weekly.updatedAt * 1000).toLocaleTimeString()}${weekly.resetsAt ? ' · Resets ' + new Date(weekly.resetsAt * 1000).toLocaleString() : ''}` : 'Waiting for the account quota report; no allowance is assumed.';
@@ -321,7 +386,9 @@ async function refresh() {
         $('profile').append(text);
       }
       $('profile').hidden = !$('profile').textContent.trim();
-      const history = await call('history', {mailbox});
+      const revision=buddy?.historyRevision;
+      if (!initialized || revision === undefined || revision !== lastHistoryRevision) {
+      const history = await timedCall('history', {mailbox, limit:50});
       if (initialized && history.some(m => m.reply && !previousReplies.has(m.id))) tone('message');
       previousReplies = new Set(history.filter(m => m.reply).map(m => m.id));
       const signature = JSON.stringify(history);
@@ -398,21 +465,29 @@ async function refresh() {
             group.append(state);
           }
           return group;
+        }, label => {
+          const divider=document.createElement('div');divider.className='history-day';
+          const text=document.createElement('span');text.textContent=label;divider.append(text);
+          return divider;
         });
-        updateHistory(history);
+        updateHistory(historyPager.merge(history));
         historySignature = signature;
+      }
+      lastHistoryRevision=revision;
       }
       if (approvals.some(a => a.mailbox === mailbox)) $('notice').textContent = '◆ Approval needed — review it from the buddy list.';
     }
     initialized = true;
   } catch (error) {
     roster = previousRoster; approvals = previousApprovalList;
+    // Retry only failed views; healthy windows are driven by the shared feed.
+    setTimeout(()=>void refresh(),5000);
     clearResponding(); $('notice').textContent = error.message;
     rosterHealth.textContent = initialized
       ? 'Buddy list refresh failed. Showing the last successful list; retrying automatically.'
       : 'Buddy list unavailable. Retrying automatically.';
   }
-  finally { refreshing = false; }
+  finally { refreshing = false; if(pendingSnapshot) void refresh(); }
 }
 
 $('search').oninput = renderRoster;
@@ -504,10 +579,10 @@ $('compose').onsubmit = async event => {
   const button = $('compose').querySelector('button[type="submit"]'); sending = true; button.disabled = true;
   attachButton.disabled = true; showAttachments();
   try {
-    const session = await call('ensure-session', {mailbox});
+    const session = await timedCall('ensure-session', {mailbox});
     if (session.state === 'cancelled') return;
     if (session.state !== 'bound') throw new Error('Session is not ready; draft kept.');
-    await call('send', {mailbox, body, images, files, request_id: lastAttempt.id}); lastAttempt = null; stagedImages = []; showAttachments(); if ($('body').value === body) $('body').value = ''; await refresh();
+    await timedCall('send', {mailbox, body, images, files, request_id: lastAttempt.id}); lastAttempt = null; stagedImages = []; showAttachments(); if ($('body').value === body) $('body').value = ''; void refresh();
   }
   catch (error) { $('notice').textContent = error.message; }
   finally { sending = false; button.disabled = false; attachButton.disabled = false; showAttachments(); }
@@ -531,4 +606,5 @@ if (mailbox !== 'buddies') {
   setInterval(checkRead, 750);
 }
 setInterval(() => IAMMessageTime.refresh(document), 30000);
-refresh(); setInterval(refresh, 2000);
+window.iam.onUpdate(snapshot=>void refresh(snapshot));
+refresh();

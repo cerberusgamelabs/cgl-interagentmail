@@ -33,6 +33,11 @@ are separate from source availability.
 
 ## Install
 
+For moving selected agents between PCs, see the v1.8
+[migration toolkit](docs/MIGRATION.md): private export, staged import with path
+mapping, and explicit pinned-session relocation. Imports do not activate agents;
+destination installation and external tool/credential setup still require review.
+
 Install the isolated command-line application from PyPI with `pipx`:
 
 ```console

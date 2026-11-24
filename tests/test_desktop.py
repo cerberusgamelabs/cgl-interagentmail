@@ -13,6 +13,30 @@ from iam_service import IAMError
 
 
 class DesktopStoreTests(unittest.TestCase):
+    def test_history_page_combines_notices_and_requests_with_one_limit(self):
+        with self.store.connect() as db:
+            db.executemany('INSERT INTO requests(id,mailbox,body,created,state) VALUES(?,?,?,?,?)',
+                           [(str(uuid.uuid4()), 'One', 'message', 100, 'queued') for i in range(30)])
+            for i in range(30):
+                db.execute('INSERT INTO notices(id,mailbox,kind,body,created) VALUES(?,?,?,?,?)',
+                           (str(uuid.uuid4()), 'One', 'status', 'notice', time.time()))
+        first = self.store.history('One', 50)
+        second = self.store.history('One', 50, [first[0]['created'], first[0]['id']])
+        self.assertEqual((50, 10), (len(first), len(second)))
+        self.assertEqual([], self.store.history('Two', 50))
+        with self.assertRaises(IAMError): self.store.history('One', 10000)
+
+    def test_history_pages_preserve_all_messages_and_timestamp_ties(self):
+        with self.store.connect() as db:
+            db.executemany('INSERT INTO requests(id,mailbox,body,created,state) VALUES(?,?,?,?,?)',
+                           [(str(uuid.uuid4()), 'One', str(i), 100, 'queued') for i in range(125)])
+        first = self.store.history('One', 50)
+        second = self.store.history('One', 50, [first[0]['created'], first[0]['id']])
+        third = self.store.history('One', 50, [second[0]['created'], second[0]['id']])
+        self.assertEqual([50, 50, 25], list(map(len, [first, second, third])))
+        self.assertEqual(125, len({r['id'] for r in first + second + third}))
+        self.assertEqual(125, len(self.store.history('One')))
+
     def test_image_only_message_is_persisted_and_retry_is_bound_to_image(self):
         raw = b'\x89PNG\r\n\x1a\nfixture'
         images = [{'name': '../../outside.png', 'data': 'data:image/png;base64,' + base64.b64encode(raw).decode()}]

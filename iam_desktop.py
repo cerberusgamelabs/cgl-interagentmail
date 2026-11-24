@@ -85,7 +85,8 @@ def start_desktop() -> str:
         raise IAMError('IAM Desktop is Windows-first; this build supports Windows only')
     if not executable.is_file():
         raise IAMError(f'Desktop dependencies are not installed. Run npm ci in {assets}')
-    env = dict(os.environ, IAM_DESKTOP_PYTHON=sys.executable)
+    env = dict(os.environ, IAM_DESKTOP_PYTHON=sys.executable,
+               IAM_DESKTOP_DATA_ROOT=str(iam.ROOT), INTERAGENTMAIL_HOME=str(iam.ROOT))
     env.pop('ELECTRON_RUN_AS_NODE', None)
     (iam.ROOT / 'run').mkdir(parents=True, exist_ok=True)
     with (iam.ROOT / 'run' / 'desktop.log').open('a', encoding='utf-8') as log:
@@ -179,6 +180,14 @@ class DesktopStore(DocumentStore):
             """)
             from iam_messenger_reads import initialize
             initialize(db)
+            db.execute('CREATE TABLE IF NOT EXISTS desktop_revisions(mailbox TEXT PRIMARY KEY, revision INTEGER NOT NULL)')
+            for table in ('requests', 'notices'):
+                for operation, ref in (('INSERT', 'NEW'), ('UPDATE', 'NEW'), ('DELETE', 'OLD')):
+                    db.execute(f'''CREATE TRIGGER IF NOT EXISTS desktop_revision_{table}_{operation}
+                        AFTER {operation} ON {table} BEGIN
+                        INSERT INTO desktop_revisions VALUES({ref}.mailbox,1)
+                        ON CONFLICT(mailbox) DO UPDATE SET revision=revision+1;
+                        END''')
 
     @contextmanager
     def connect(self):
@@ -330,21 +339,27 @@ class DesktopStore(DocumentStore):
             db.execute("UPDATE requests SET reply=?,state='replied',error=NULL WHERE id=?", (body, request_id))
         return {"request_id": request_id, "published": True}
 
-    def history(self, mailbox):
+    def history(self, mailbox, limit=200, before=None):
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise IAMError('Invalid history page size')
+        if before is not None and (not isinstance(before, list) or len(before) != 2
+                or type(before[0]) not in (int, float) or not isinstance(before[1], str)):
+            raise IAMError('Invalid history cursor')
+        stamp, identity = before if before is not None else (1e100, '')
         with self.connect() as db:
-            rows = [dict(r) for r in db.execute("SELECT id,body,created,state,reply,error,(SELECT created FROM reply_times WHERE request_id=requests.id) AS replied_at FROM requests WHERE mailbox=? ORDER BY created DESC LIMIT 200", (mailbox,))][::-1]
+            rows = [dict(r) for r in db.execute("SELECT id,body,created,state,reply,error,(SELECT created FROM reply_times WHERE request_id=requests.id) AS replied_at FROM requests WHERE mailbox=? AND (created<? OR (created=? AND id<?)) ORDER BY created DESC,id DESC LIMIT ?", (mailbox, stamp, stamp, identity, limit))][::-1]
             for r in rows:
                 image_row = db.execute('SELECT data FROM images WHERE request_id=?', (r['id'],)).fetchone()
                 r['images'] = [{'name': i['name']} for i in json.loads(image_row[0])] if image_row else []
                 r['reply_images'] = self.published_image_refs(db, 'reply', r['id'], mailbox)
                 r['files'] = self.document_refs(db, 'request', r['id'], mailbox)
                 r['reply_files'] = self.document_refs(db, 'reply', r['id'], mailbox)
-            for n in db.execute("SELECT id,body,created,kind FROM notices WHERE mailbox=? ORDER BY created DESC LIMIT 200", (mailbox,)):
+            for n in db.execute("SELECT id,body,created,kind FROM notices WHERE mailbox=? AND (created<? OR (created=? AND id<?)) ORDER BY created DESC,id DESC LIMIT ?", (mailbox, stamp, stamp, identity, limit)):
                 rows.append({'id': n['id'], 'body': None, 'reply': n['body'], 'created': n['created'],
                              'replied_at': n['created'], 'state': 'replied', 'notice_kind': n['kind'],
                              'reply_images': self.published_image_refs(db, 'notice', n['id'], mailbox),
                              'reply_files': self.document_refs(db, 'notice', n['id'], mailbox)})
-            return sorted(rows, key=lambda r: r['created'])
+            return sorted(rows, key=lambda r: (r['created'], r['id']))[-limit:]
 
     @staticmethod
     def published_image_refs(db, kind, message_id, mailbox):
@@ -1046,6 +1061,7 @@ class DesktopBackend:
                 approvals = [dict(r) for r in db.execute("SELECT id,mailbox,method,created FROM approvals WHERE state='pending' AND id IN (SELECT id FROM approval_leases WHERE expires>?)", (time.time(),))]
                 from iam_messenger_reads import unread as unread_events
                 unread = {m:len(unread_events(db,m)) for m in config['projects']}
+                revisions = {r[0]:r[1] for r in db.execute('SELECT mailbox,revision FROM desktop_revisions')}
             responding = set()
             for request in waiting:
                 owner = session_owner(request['mailbox'], config)
@@ -1060,6 +1076,7 @@ class DesktopBackend:
                                 'responding': m in responding,
                                 'availability': self.statuses.get(session_owner(m, config), 'not attached'),
                                 'context': self.context_snapshot(m, config),
+                                'historyRevision': revisions.get(m, 0),
                                 'unread': unread.get(m, 0), 'profile': self.store.profile(m)} for m in config['projects']], 'approvals': approvals, 'notices': notices, 'weekly': self.weekly, 'credits': self.credits}
             from iam_messenger_profiles import publish_runtime
             publish_runtime(self.store,result['buddies'])
@@ -1069,7 +1086,7 @@ class DesktopBackend:
                 db.execute('UPDATE notices SET dismissed=1 WHERE id=?', (args['id'],))
             return {'dismissed': True}
         if action == 'history':
-            return self.store.history(args['mailbox'])
+            return self.store.history(args['mailbox'], args.get('limit', 200), args.get('before'))
         if action == 'mark-read':
             from iam_messenger_reads import mark
             with self.store.connect() as db:

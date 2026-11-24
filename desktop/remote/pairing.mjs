@@ -1,4 +1,13 @@
 // QR/manual invitation parsing never changes the logged-in server or identity.
+// Null is an explicit, server-approved until-revoked grant; absent is not trusted.
+export function grantValid(value,now=Date.now()) {
+  return Boolean(value?.grantId) && (value.grantExpires===null ||
+    (Number.isSafeInteger(value.grantExpires) && value.grantExpires*1000>now));
+}
+export function notificationExpiry(value,session) {
+  const deadline=Math.floor(session.expiresAt/1000);
+  return value.grantExpires===null?deadline:Math.min(value.grantExpires,deadline);
+}
 export function parseInvitation(code,home) {
   if(typeof code!=='string' || code.length>4096 || !/^iam-pair:[A-Za-z0-9_-]+$/.test(code))throw new Error('Invalid Desktop pairing code');
   let value;

@@ -2955,6 +2955,8 @@ def parser() -> argparse.ArgumentParser:
     heartbeat.set_defaults(func=cmd_heartbeat)
     from iam_hooks import add_parser as add_hooks_parser
     add_hooks_parser(sub)
+    from iam_migration import add_parser as add_migration_parser
+    add_migration_parser(sub)
 
     capabilities = sub.add_parser("capabilities", help="Describe IAM's stable automation interface.")
     capabilities.add_argument("--json", action="store_true", dest="json_output")
